@@ -1,16 +1,26 @@
-# Novel Auto Generator | 小说自动生成器
+# 角色卡批量生成器 | Role Card Batch
 
 <div align="center">
 
-[![GitHub tag (latest by date)](https://img.shields.io/github/v/tag/CyrilPeng/Novel-Auto-Generator?sort=semver&label=version&color=blue)](https://github.com/CyrilPeng/Novel-Auto-Generator/tags)
+[![GitHub tag](https://img.shields.io/github/v/tag/cjhkcjgk3-sys/st-role-card-batch?sort=semver&label=version&color=blue)](https://github.com/cjhkcjgk3-sys/st-role-card-batch/tags)
 [![SillyTavern](https://img.shields.io/badge/SillyTavern-1.14.0%2B-green.svg)](https://github.com/SillyTavern/SillyTavern)
-[![License](https://img.shields.io/badge/license-MIT-orange.svg)](https://github.com/CyrilPeng/Novel-Auto-Generator/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-orange.svg)](LICENSE)
 
-**SillyTavern 扩展插件 — AI 自动续写小说 + TXT 转世界书**
+**SillyTavern 扩展插件 — 角色卡批量生成**
 
-[快速开始](#快速开始) · [自动生成](#自动生成小说) · [TXT转世界书](txtToWorldbook.md) · [高级功能](#高级功能) · [常见问题](#常见问题)
+[快速开始](#快速开始) · [高级功能](#高级功能) · [常见问题](#常见问题)
 
 </div>
+
+---
+
+## 来源与独立性
+
+本项目分叉自 [CyrilPeng/Novel-Auto-Generator](https://github.com/CyrilPeng/Novel-Auto-Generator)（MIT），自 v1.15.x 起独立维护。
+
+发展方向是**角色卡批量生成**：名单批量写卡、已完成名录去重、图片库匹配、手机端性能与交互。上游自带的小说续写与 TXT 转世界书模块仍留在当前代码里，但不再是主要维护方向，后续会逐步移除。
+
+原始版权归 CyrilPeng 所有，许可证见 [LICENSE](LICENSE)。
 
 ---
 
