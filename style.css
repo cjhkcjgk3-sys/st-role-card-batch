@@ -985,6 +985,10 @@
     display: none;
 }
 
+.nag-role-image-preview-layer:not([open]) {
+    display: none;
+}
+
 .nag-role-image-preview-layer[open] {
     display: flex;
 }

@@ -1817,7 +1817,7 @@ export function initNovelUI(host) {
 
             </div>
         </div>
-        <dialog id="nag-role-image-preview" class="nag-role-image-preview-layer" aria-label="角色原图">
+        <dialog id="nag-role-image-preview" class="nag-role-image-preview-layer" aria-label="角色原图" hidden>
             <div class="nag-role-image-preview-dialog">
                 <button type="button" class="nag-role-image-preview-close" aria-label="关闭">✕</button>
                 <img alt="" decoding="async">
