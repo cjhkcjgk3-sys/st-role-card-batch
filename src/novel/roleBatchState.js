@@ -1,8 +1,38 @@
 import { newIdentity } from '../core/chunkIdentity.js';
 import { createRoleNameMatcher, parseWithWorkKeys, workKeysOf } from './roleName.js';
 
-export const roleComplete = (item) =>
-    item?.manualStatus === 'complete' || (item?.manualStatus !== 'failed' && !!item?.processed && !item.failed);
+/** One precedence rule for task state, archive display and queue skipping. */
+export function resolveRoleStatus(item, archiveMatch = false) {
+    if (item?.manualStatus === 'complete')
+        return { status: 'complete', complete: true, failed: false, manual: true, archived: false, source: 'manual' };
+    if (item?.manualStatus === 'failed')
+        return { status: 'failed', complete: false, failed: true, manual: true, archived: false, source: 'manual' };
+    if (item?.processing)
+        return {
+            status: 'processing',
+            complete: false,
+            failed: false,
+            manual: false,
+            archived: false,
+            source: 'batch',
+        };
+    if (item?.processed)
+        return {
+            status: item.failed ? 'failed' : 'complete',
+            complete: !item.failed,
+            failed: !!item.failed,
+            manual: false,
+            archived: !!archiveMatch && !item.failed,
+            source: 'batch',
+        };
+    if (item?.failed)
+        return { status: 'failed', complete: false, failed: true, manual: false, archived: false, source: 'batch' };
+    if (archiveMatch)
+        return { status: 'complete', complete: true, failed: false, manual: false, archived: true, source: 'archive' };
+    return { status: 'queued', complete: false, failed: false, manual: false, archived: false, source: 'queue' };
+}
+
+export const roleComplete = (item) => resolveRoleStatus(item).complete;
 export const parseRoleNames = (text) => [
     ...new Set(
         String(text || '')
@@ -152,6 +182,143 @@ export function removeRoleArchiveName(archive, name) {
     return normalizeRoleArchive(archive).filter((entry) => entry !== target);
 }
 
+/** Remove the archive spelling for a role without deleting another work's same-name character. */
+export function removeRoleArchiveMatches(archive, name, workNames = []) {
+    const names = normalizeRoleArchive(archive);
+    const target = String(name || '').trim();
+    if (!target) return names;
+    if (names.includes(target)) return names.filter((entry) => entry !== target);
+    const matcher = createRoleNameMatcher([target], workNames);
+    const matches = names.filter((entry) => matcher.has(entry));
+    if (!matches.length) return names;
+
+    const workKeys = workKeysOf(workNames);
+    const targetRole = parseWithWorkKeys(target, workKeys);
+    const parsedMatches = matches.map((entry) => [entry, parseWithWorkKeys(entry, workKeys)]);
+    const parsedByName = new Map(parsedMatches);
+    if (targetRole.work) {
+        const hasOtherWork = parsedMatches.some(([, role]) => role.work && role.work !== targetRole.work);
+        return names.filter((entry) => {
+            const role = parsedByName.get(entry);
+            if (!role) return true;
+            return (role.work && role.work !== targetRole.work) || (!role.work && hasOtherWork);
+        });
+    }
+    const works = new Set(parsedMatches.map(([, role]) => role.work).filter(Boolean));
+    if (works.size > 1) return names;
+    return names.filter((entry) => !matches.includes(entry));
+}
+
+/** Apply a user archive edit to the matching roles in the current and retained task records. */
+export function applyRoleArchiveChanges(batch, previousArchive, nextArchive, workNames = []) {
+    if (!batch) return { added: [], removed: [] };
+    const previousNames = normalizeRoleArchive(previousArchive);
+    const nextNames = normalizeRoleArchive(nextArchive);
+    const previousSet = new Set(previousNames);
+    const nextSet = new Set(nextNames);
+    const addedNames = nextNames.filter((name) => !previousSet.has(name));
+    const removedNames = previousNames.filter((name) => !nextSet.has(name));
+    const candidates = [...(batch.items || []), ...(batch.history || [])];
+    if (addedNames.length + removedNames.length === 1) {
+        const isAdded = addedNames.length === 1;
+        const changedName = isAdded ? addedNames[0] : removedNames[0];
+        const exactItems = candidates.filter((item) => String(item.name || '').trim() === changedName);
+        // Generated roles normally use the same full name in both stores. Resolve that common
+        // case directly; the matcher path below remains for qualified/bare-name aliases.
+        if (exactItems.length) {
+            const previousIndex = batch.index;
+            const changedItems = [];
+            for (const item of exactItems) {
+                const status = resolveRoleStatus(item);
+                if (isAdded && status.source !== 'queue') continue;
+                changedItems.push([item, { ...item }]);
+                Object.assign(
+                    item,
+                    isAdded
+                        ? {
+                              archived: true,
+                              processed: true,
+                              failed: false,
+                              processing: false,
+                              manualStatus: null,
+                              error: null,
+                          }
+                        : {
+                              archived: false,
+                              processed: false,
+                              failed: false,
+                              processing: false,
+                              manualStatus: null,
+                              error: null,
+                              swipe: null,
+                          },
+                );
+            }
+            batch.index = nextRoleIndex(batch);
+            return {
+                added: isAdded ? exactItems.map((item) => item.name) : [],
+                removed: isAdded ? [] : exactItems.map((item) => item.name),
+                rollback() {
+                    for (const [item, previous] of changedItems) {
+                        for (const key of Object.keys(item)) if (!Object.hasOwn(previous, key)) delete item[key];
+                        Object.assign(item, previous);
+                    }
+                    batch.index = previousIndex;
+                },
+            };
+        }
+    }
+    const addedMatcher = addedNames.length ? createRoleNameMatcher(addedNames, workNames) : null;
+    const removedMatcher = removedNames.length ? createRoleNameMatcher(removedNames, workNames) : null;
+    const added = [];
+    const removed = [];
+    const previousIndex = batch.index;
+    const changedItems = [];
+    for (const item of candidates) {
+        const name = String(item.name || '').trim();
+        const addedMatch = addedMatcher?.has(name) ?? false;
+        const removedMatch = removedMatcher?.has(name) ?? false;
+        if (!item.archived && !addedMatch && !removedMatch) continue;
+        if (addedMatch) {
+            if (resolveRoleStatus(item).source !== 'queue') continue;
+            changedItems.push([item, { ...item }]);
+            Object.assign(item, {
+                archived: true,
+                processed: true,
+                failed: false,
+                processing: false,
+                manualStatus: null,
+                error: null,
+            });
+            added.push(name);
+        } else if (removedMatch) {
+            changedItems.push([item, { ...item }]);
+            Object.assign(item, {
+                archived: false,
+                processed: false,
+                failed: false,
+                processing: false,
+                manualStatus: null,
+                error: null,
+                swipe: null,
+            });
+            removed.push(name);
+        }
+    }
+    batch.index = nextRoleIndex(batch);
+    return {
+        added,
+        removed,
+        rollback() {
+            for (const [item, previous] of changedItems) {
+                for (const key of Object.keys(item)) if (!Object.hasOwn(previous, key)) delete item[key];
+                Object.assign(item, previous);
+            }
+            batch.index = previousIndex;
+        },
+    };
+}
+
 /**
  * Mark list entries the persisted archive already holds as finished without generating them again.
  * Releasing a name from the archive lets the next run regenerate that role.
@@ -163,8 +330,19 @@ export function applyArchiveSkips(batch, archive, workNames = []) {
     const skipped = [];
     for (const item of batch?.items || []) {
         const name = String(item.name || '').trim();
-        if (archived.has(name)) {
-            if (roleComplete(item)) continue;
+        const archiveMatch = archived.has(name);
+        const status = resolveRoleStatus(item, archiveMatch);
+        // Older checkpoints may retain an archive bit after its name was removed. Clear the
+        // stale bit without replacing a real failure or manual correction. An archive-only item
+        // has no generated swipe, so it returns to the queue once the archive match is gone.
+        if (item.archived && !archiveMatch) {
+            item.archived = false;
+            if (!status.manual && !status.failed && item.swipe == null) {
+                Object.assign(item, { processed: false, failed: false, processing: false, error: null });
+            }
+            continue;
+        }
+        if (status.source === 'archive') {
             Object.assign(item, {
                 archived: true,
                 processed: true,
@@ -172,10 +350,9 @@ export function applyArchiveSkips(batch, archive, workNames = []) {
                 processing: false,
                 manualStatus: null,
                 swipe: null,
+                error: null,
             });
             skipped.push(name);
-        } else if (item.archived) {
-            Object.assign(item, { archived: false, processed: false, processing: false });
         }
     }
     if (batch?.names) batch.index = nextRoleIndex(batch);

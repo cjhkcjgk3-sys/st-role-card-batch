@@ -163,12 +163,18 @@ export function createSillyTavernHost({
         for (const item of [...batch.items, ...(batch.history || [])]) {
             const pendingAttempt =
                 batch.pending && batch.dispatch?.itemId === item.id ? batch.dispatch.attemptId : null;
+            // Clearing the task's swipe pointer is an explicit requeue (for example after
+            // deleting a completed-name archive entry). Keep the old page, but don't let its
+            // receipt immediately mark the task complete again. A receipt for the currently
+            // pending attempt is still recoverable after a reload.
+            const explicitlyRequeued = item.swipe === null && !item.archived && item.manualStatus == null;
             // 回执里的 status 是「生成那一刻」的快照：当时判成截断（invalid）或流被中断（partial），
             // 卡片后来补完、或者判定规则调整过，就永远算不成完成，界面上一直显示没做。
             // 这里以正文为准重新校验，通过就认；pending（请求还没回来）仍然不算，避免把上一页正文当结果。
             const recoverableStatus = new Set(['invalid', 'partial']);
             const matching = (text, swipe) => {
                 const receipt = reply?.swipe_info?.[swipe]?.extra?.nag_role_batch;
+                if (explicitlyRequeued && (!pendingAttempt || receipt?.attemptId !== pendingAttempt)) return false;
                 if (receipt?.taskId !== batch.id || receipt.itemId !== item.id || receipt.previewId) return false;
                 if (!text?.trim() || text.trim() === '...') return false;
                 if (receipt.origin !== 'worldbook' && isRoleCardTruncated(text, validationOptions)) return false;

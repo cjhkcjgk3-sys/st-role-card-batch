@@ -3,6 +3,7 @@ import { buildRoleMergePlan, mergeRolePlan, renderRoleComparison, validateRoleMe
 import { createBufferedStream } from '../host/bufferedStream.js';
 import { createRoleBatchRecoveryStore } from './recoveryStore.js';
 import {
+    applyArchiveSkips,
     countUnidentifiedRolePages,
     duplicateRoleNames,
     dedupeRoleArchive,
@@ -10,6 +11,7 @@ import {
     normalizeRoleArchive,
     removeRoleArchiveName,
     roleComplete,
+    resolveRoleStatus,
     updateRoleNames,
 } from './roleBatchState.js';
 import { createRoleBatchRunner, parseRoleNames } from './roleBatch.js';
@@ -102,7 +104,17 @@ export function initNovelUI(host) {
     let roleSelection = null;
     let generationStats = { startTime: null, chaptersGenerated: 0, totalCharacters: 0, errors: [] };
     let roleSuccessNotices = [];
+    let archiveRevision = 0;
+    let archiveMatcherCache = null;
+    let renderedArchiveKey = null;
+    let progressCountCache = null;
     const pluginVersion = '2.0.0';
+    function invalidateRoleArchive() {
+        archiveRevision++;
+        archiveMatcherCache = null;
+        renderedArchiveKey = null;
+        progressCountCache = null;
+    }
     function recordError(error, details = {}) {
         if (['ABORTED', 'USER_STOPPED'].includes(error?.code)) return;
         const entries = Array.isArray(settings.errorLog) ? settings.errorLog : [];
@@ -610,13 +622,15 @@ export function initNovelUI(host) {
         onStats: (stats) => {
             generationStats = stats;
         },
+        onRoleArchiveChange: invalidateRoleArchive,
         onRoleComplete: (name) => {
             // onChange/saveSettings follows every checkpoint, so this is persisted with the batch.
-            // 用缓存的匹配器判断是否已收录，命中就增量更新，避免每次重建（O(n²)）。
-            const archive = normalizeRoleArchive(settings.roleArchive);
+            // Keep the canonical array and matcher in sync; copying/normalizing the full list
+            // for every successful role made a long batch quadratic.
+            const archive = Array.isArray(settings.roleArchive) ? settings.roleArchive : (settings.roleArchive = []);
             const matcher = getArchiveMatcher(archive, settings.roleImageLibrary?.workNames);
             if (matcher.has(name)) return;
-            settings.roleArchive = [...archive, name];
+            archive.push(name);
             rememberArchiveName(name);
         },
     });
@@ -655,11 +669,8 @@ export function initNovelUI(host) {
         },
     });
     /** 名单行的状态图标：进行中 / 失败 / 已完成 / 排队。 */
-    function roleStatusIcon(item) {
-        if (item.processing) return '⏳';
-        if (item.failed) return '❌';
-        if (item.processed) return '✅';
-        return '⏳';
+    function roleStatusIcon(status) {
+        return { processing: '⏳', failed: '❌', complete: '✅', queued: '⏳' }[status] || '⏳';
     }
 
     async function startGeneration() {
@@ -1142,6 +1153,7 @@ export function initNovelUI(host) {
             .catch((error) => recordError(error, { phase: 'restore-legacy-visibility' }));
         settings.panelCollapsed = Object.assign({}, defaultSettings.panelCollapsed, settings.panelCollapsed || {});
         settings.roleArchive = dedupeRoleArchive(settings.roleArchive, settings.roleImageLibrary?.workNames);
+        invalidateRoleArchive();
         settings.isRunning = false;
         settings.isPaused = false;
         try {
@@ -1204,28 +1216,30 @@ export function initNovelUI(host) {
 
     // 名录匹配器只在名录或作品名清单变化时重建。生成时每秒都会 updateUI，
     // 上万条名录重建一次要 160ms 以上，不能每次都现算。
-    let archiveMatcherCache = null;
     function getArchiveMatcher(names, workNames) {
         const workKey = Array.isArray(workNames) ? workNames.join('\u0000') : '';
         const cached = archiveMatcherCache;
-        if (
-            cached &&
-            cached.workKey === workKey &&
-            cached.names.length === names.length &&
-            cached.names.every((name, index) => name === names[index])
-        )
-            return cached.matcher;
+        if (cached && cached.revision === archiveRevision && cached.workKey === workKey) return cached.matcher;
         const matcher = createRoleNameMatcher(names, workNames);
-        archiveMatcherCache = { names: [...names], workKey, matcher };
+        archiveMatcherCache = { revision: archiveRevision, workKey, matcher };
         return matcher;
     }
 
     /** 收录成功后增量更新缓存，避免每完成一个角色就重建整个匹配器。 */
     function rememberArchiveName(name) {
+        archiveRevision++;
+        progressCountCache = null;
+        renderedArchiveKey = null;
         const cached = archiveMatcherCache;
-        if (!cached) return;
-        cached.names.push(name);
+        const workKey = Array.isArray(settings.roleImageLibrary?.workNames)
+            ? settings.roleImageLibrary.workNames.join('\u0000')
+            : '';
+        if (!cached || cached.workKey !== workKey) {
+            archiveMatcherCache = null;
+            return;
+        }
         cached.matcher.add(name);
+        cached.revision = archiveRevision;
     }
 
     // 列表分页：只保留当前页的行，翻页后不累积 DOM。
@@ -1243,12 +1257,11 @@ export function initNovelUI(host) {
         $(`#${prefix}-page`).text(`${page + 1} / ${pages} 页（共 ${total} 个）`);
     }
 
-    let renderedArchiveKey = null;
     function renderRoleArchive(names) {
         archiveRowsPage = Math.min(archiveRowsPage, Math.max(0, Math.ceil(names.length / ROLE_ROWS_PAGE) - 1));
         const start = archiveRowsPage * ROLE_ROWS_PAGE;
         const shown = names.slice(start, start + ROLE_ROWS_PAGE);
-        const key = archiveRowsPage + '\u0000' + names.join('\n');
+        const key = `${archiveRevision}:${archiveRowsPage}`;
         if (key === renderedArchiveKey) return;
         renderedArchiveKey = key;
         $('#nag-archive-count').text(names.length ? `（${names.length}）` : '');
@@ -1264,12 +1277,24 @@ export function initNovelUI(host) {
         renderPager('nag-archive', names.length, archiveRowsPage);
     }
 
-    function saveRoleArchive(next, message) {
-        settings.roleArchive = normalizeRoleArchive(next);
-        saveSettings();
-        renderedArchiveKey = null;
+    async function saveRoleArchive(transform, message) {
+        if (settings.isRunning || fileOperation) return;
+        fileOperation = true;
         updateUI();
-        if (message) toastr.info(message);
+        try {
+            const previous = normalizeRoleArchive(settings.roleArchive);
+            const next = normalizeRoleArchive(transform(previous));
+            const unchanged = previous.length === next.length && previous.every((name, index) => name === next[index]);
+            const result = unchanged ? { added: [], removed: [] } : await roleRunner.setRoleArchive(next);
+            if (!unchanged) saveSettings();
+            if (message) toastr.info(typeof message === 'function' ? message({ result, previous, next }) : message);
+        } catch (error) {
+            recordError(error, { phase: 'change-role-archive' });
+            toastr.warning(error.message);
+        } finally {
+            fileOperation = false;
+            updateUI();
+        }
     }
 
     function updateUI() {
@@ -1281,6 +1306,7 @@ export function initNovelUI(host) {
             const parsed = parseRoleNames(settings.roleNames);
             if (batch.names && JSON.stringify(batch.names) !== JSON.stringify(parsed)) {
                 updateRoleNames(batch, parsed);
+                applyArchiveSkips(batch, settings.roleArchive, settings.roleImageLibrary?.workNames);
                 batch.inputNames = settings.roleNames;
                 batch.inputLimit = settings.totalChapters;
             }
@@ -1299,24 +1325,44 @@ export function initNovelUI(host) {
         );
         $('#nag-btn-role-image-import, #nag-btn-role-image-clear, #nag-role-image-file').prop('disabled', busy);
         if (batchMode) renderChecklistPicker();
-        const archiveNames = normalizeRoleArchive(settings.roleArchive);
+        const archiveNames = Array.isArray(settings.roleArchive) ? settings.roleArchive : [];
         const archiveNameMatcher = getArchiveMatcher(archiveNames, imageLibrary?.workNames);
-        // 名录中的角色要等到点「开始／继续」才被标记跳过；在那之前也让它们显示为已完成，
-        // 否则界面上看着像还在排队，实际却不会被生成。
-        const archivedFlags = batchMode
-            ? roleNames.map((name, index) => {
-                  const item = batch?.items?.[index];
-                  return !!item?.archived || (!roleComplete(item) && archiveNameMatcher.has(name));
-              })
-            : [];
         const total = batchMode ? roleNames.length : settings.totalChapters;
-        const completed = batchMode
-            ? (batch?.items || []).filter((item, index) => roleComplete(item) || archivedFlags[index]).length
-            : settings.currentChapter;
+        let completed = batchMode ? 0 : settings.currentChapter;
+        if (batchMode && batch) {
+            const cached = progressCountCache;
+            if (
+                cached &&
+                cached.batch === batch &&
+                cached.revision === batch?.revision &&
+                cached.items === batch?.items &&
+                cached.names === roleNames &&
+                cached.archiveRevision === archiveRevision
+            ) {
+                completed = cached.completed;
+            } else {
+                completed = 0;
+                for (let index = 0; index < roleNames.length; index++) {
+                    const item = batch?.items?.[index];
+                    if (resolveRoleStatus(item, archiveNameMatcher.has(roleNames[index])).complete) completed++;
+                }
+                progressCountCache = {
+                    batch,
+                    revision: batch?.revision,
+                    items: batch?.items,
+                    names: roleNames,
+                    archiveRevision,
+                    completed,
+                };
+            }
+        }
         const pct = total > 0 ? ((completed / total) * 100).toFixed(1) : 0;
         $('#nag-progress-fill').css('width', `${pct}%`);
         $('#nag-progress-text').text(`${completed} / ${total} (${pct}%)`);
         renderRoleArchive(archiveNames);
+        $(
+            '#nag-archive-input, #nag-btn-archive-add, #nag-btn-archive-collect, #nag-btn-archive-clear, .nag-archive-remove',
+        ).prop('disabled', busy);
         const repeatedNames = batchMode ? duplicateRoleNames(settings.roleNames) : [];
         $('#nag-role-duplicate-hint')
             .toggle(repeatedNames.length > 0)
@@ -1368,14 +1414,9 @@ export function initNovelUI(host) {
                   const index = rowStart + offset;
                   const item = batch?.items[index] || {};
                   const suffix = item.processing ? ` 第 ${batch.attempt}/3 次尝试` : '';
-                  const manual = item.manualStatus ? '（手动）' : '';
-                  const archived = archivedFlags[index] ?? false;
-                  const archivedMark = archived ? '（名录）' : '';
-                  // 开始前就按已完成显示，不再挂着「排队」的沙漏
-                  const statusItem =
-                      archived && !roleComplete(item)
-                          ? { ...item, processed: true, failed: false, processing: false }
-                          : item;
+                  const roleState = resolveRoleStatus(item, archiveNameMatcher.has(name));
+                  const manual = roleState.manual ? '（手动）' : '';
+                  const archivedMark = roleState.archived ? '（名录）' : '';
                   // 失败原因以前只存在数据里、界面上看不到，用户只能看到一个 ❌
                   const failureMark = item.error
                       ? ` <span class="nag-role-failure" data-index="${index}" title="${escapeAttribute(item.error)}">⚠</span>`
@@ -1386,7 +1427,7 @@ export function initNovelUI(host) {
                           : '';
                   return {
                       key: `${index}:${name}`,
-                      main: `${roleStatusIcon(statusItem)} ${index + 1}. ${escapeHtml(name)}${suffix}${manual}${archivedMark}${failureMark}`,
+                      main: `${roleStatusIcon(roleState.status)} ${index + 1}. ${escapeHtml(name)}${suffix}${manual}${archivedMark}${failureMark}`,
                       controls,
                       slot: roleImageSlot(name, index, imageLibrary),
                   };
@@ -1922,11 +1963,14 @@ export function initNovelUI(host) {
         $('#nag-btn-archive-add').on('click', () => {
             const names = parseRoleNames(String($('#nag-archive-input').val() || ''));
             if (!names.length) return toastr.info('请先输入角色名，每行一个');
-            const before = normalizeRoleArchive(settings.roleArchive).length;
-            const merged = mergeRoleArchive(settings.roleArchive, names, settings.roleImageLibrary?.workNames);
-            $('#nag-archive-input').val('');
-            if (merged.length === before) return toastr.info('这些名字都已在名录中');
-            saveRoleArchive(merged, `已收录 ${merged.length - before} 个名字`);
+            void saveRoleArchive(
+                (archive) => mergeRoleArchive(archive, names, settings.roleImageLibrary?.workNames),
+                ({ previous, next }) => {
+                    const added = next.length - previous.length;
+                    if (added) $('#nag-archive-input').val('');
+                    return added ? `已收录 ${added} 个名字` : '这些名字都已在名录中';
+                },
+            );
         });
         $('#nag-btn-archive-collect').on('click', () => {
             const batch = settings.roleBatch;
@@ -1935,17 +1979,23 @@ export function initNovelUI(host) {
                 .filter((item) => roleComplete(item) && item.name)
                 .map((item) => item.name);
             if (!names.length) return toastr.info('当前没有已完成的角色可收录');
-            const before = normalizeRoleArchive(settings.roleArchive).length;
-            const merged = mergeRoleArchive(settings.roleArchive, names, settings.roleImageLibrary?.workNames);
-            if (merged.length === before) return toastr.info('已完成角色都已在名录中');
-            saveRoleArchive(merged, `已收录 ${merged.length - before} 个已完成角色`);
+            void saveRoleArchive(
+                (archive) => mergeRoleArchive(archive, names, settings.roleImageLibrary?.workNames),
+                ({ previous, next }) => {
+                    const added = next.length - previous.length;
+                    return added ? `已收录 ${added} 个已完成角色` : '已完成角色都已在名录中';
+                },
+            );
         });
         $('#nag-archive-list').on('click', '.nag-archive-remove', function () {
             const name = normalizeRoleArchive(settings.roleArchive)[Number($(this).attr('data-index'))];
             if (!name) return;
-            saveRoleArchive(
-                removeRoleArchiveName(settings.roleArchive, name),
-                `已从名录删除「${name}」，下次开始时会重新生成`,
+            void saveRoleArchive(
+                (archive) => removeRoleArchiveName(archive, name),
+                ({ previous, next }) =>
+                    previous.length === next.length
+                        ? `「${name}」不在名录中`
+                        : `已从名录删除「${name}」，对应角色已重新排队`,
             );
         });
         $('#nag-btn-archive-clear').on('click', async () => {
@@ -1955,11 +2005,11 @@ export function initNovelUI(host) {
                 typeof popup?.confirm === 'function' &&
                 !(await popup.confirm(
                     '清空已完成角色名录',
-                    '只会删除名录中的名字，不会删除任何角色卡或回复。确定清空？',
+                    '已生成的角色会改为待生成，不会删除角色卡或回复。确定清空？',
                 ))
             )
                 return;
-            saveRoleArchive([], '已完成角色名录已清空');
+            void saveRoleArchive(() => [], '已完成角色名录已清空');
         });
         $('#nag-btn-export-txt').on('click', () => exportNovel(false));
         $('#nag-btn-export-json').on('click', () => exportAsJSON(false));

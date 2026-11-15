@@ -2,8 +2,11 @@ import { abortableDelay, throwIfAborted } from '../core/requestPolicy.js';
 import { newIdentity } from '../core/chunkIdentity.js';
 import {
     applyArchiveSkips,
+    applyRoleArchiveChanges,
     hydrateRoleBatch,
     nextRoleIndex,
+    normalizeRoleArchive,
+    removeRoleArchiveMatches,
     roleComplete,
     updateRoleNames,
     parseRoleNames,
@@ -23,6 +26,7 @@ export function createRoleBatchRunner({
     onError = () => {},
     recovery,
     onRoleComplete = () => {},
+    onRoleArchiveChange = () => {},
 }) {
     let active = null;
     let preparing = false;
@@ -77,6 +81,7 @@ export function createRoleBatchRunner({
         batch.inputNames = getSettings().roleNames;
         batch.inputLimit = getSettings().totalChapters;
         updateRoleNames(batch, parseRoleNames(batch.inputNames));
+        applyArchiveSkips(batch, getSettings().roleArchive, getSettings().roleImageLibrary?.workNames);
         try {
             checkpoint();
         } catch (error) {
@@ -684,6 +689,39 @@ export function createRoleBatchRunner({
         previewPending: () => !!state()?.preview,
         restore,
         saveInput,
+        async setRoleArchive(nextArchive) {
+            if (active || preparing) throw new Error('请先停止任务，再修改已完成角色名录');
+            restore();
+            if (host.snapshot().generating === true) throw new Error('请等待酒馆当前生成结束');
+            const settings = getSettings();
+            const previousArchive = normalizeRoleArchive(settings.roleArchive);
+            const next = normalizeRoleArchive(nextArchive);
+            if (previousArchive.length === next.length && previousArchive.every((name, index) => name === next[index]))
+                return { added: [], removed: [] };
+            const batch = state();
+            preparing = true;
+            let archiveChanges = null;
+            try {
+                settings.roleArchive = next;
+                archiveChanges = applyRoleArchiveChanges(
+                    batch,
+                    previousArchive,
+                    next,
+                    settings.roleImageLibrary?.workNames,
+                );
+                onRoleArchiveChange();
+                if (batch) checkpoint();
+                else onChange();
+                return { added: archiveChanges.added, removed: archiveChanges.removed };
+            } catch (error) {
+                settings.roleArchive = previousArchive;
+                archiveChanges?.rollback?.();
+                onRoleArchiveChange();
+                throw error;
+            } finally {
+                preparing = false;
+            }
+        },
         async setRoleStatus(index, status) {
             if (active || preparing) throw new Error('请先停止任务，再手动纠错');
             if (!['complete', 'failed', 'auto'].includes(status)) throw new Error('无效的角色状态');
@@ -695,6 +733,8 @@ export function createRoleBatchRunner({
             assertNoPreview(batch);
             preparing = true;
             const previous = structuredClone(batch);
+            const settings = getSettings();
+            const previousArchive = normalizeRoleArchive(settings.roleArchive);
             try {
                 await host.reconcileRoleBatch(batch, validationOptions());
                 if (host.snapshot().identity !== batch.identity) throw new Error('聊天已切换，请返回原聊天');
@@ -702,16 +742,54 @@ export function createRoleBatchRunner({
                 if (!item || item.id !== previous.items[index].id) throw new Error('角色名单已变化，请重新选择');
                 item.manualStatus = status === 'auto' ? null : status;
                 if (status === 'complete') {
-                    Object.assign(item, { processed: true, failed: false, processing: false });
+                    Object.assign(item, {
+                        processed: true,
+                        failed: false,
+                        processing: false,
+                        archived: false,
+                        error: null,
+                    });
                     onRoleComplete(item.name);
                 }
-                if (status === 'failed') Object.assign(item, { processed: true, failed: true, processing: false });
-                if (status === 'auto') await host.reconcileRoleBatch(batch, validationOptions());
+                if (status === 'failed') {
+                    const nextArchive = removeRoleArchiveMatches(
+                        settings.roleArchive,
+                        item.name,
+                        settings.roleImageLibrary?.workNames,
+                    );
+                    const archiveChanged =
+                        previousArchive.length !== nextArchive.length ||
+                        previousArchive.some((name, position) => name !== nextArchive[position]);
+                    if (archiveChanged) {
+                        settings.roleArchive = nextArchive;
+                        applyRoleArchiveChanges(
+                            batch,
+                            previousArchive,
+                            nextArchive,
+                            settings.roleImageLibrary?.workNames,
+                        );
+                        onRoleArchiveChange();
+                    }
+                    Object.assign(item, {
+                        processed: true,
+                        failed: true,
+                        processing: false,
+                        archived: false,
+                        manualStatus: 'failed',
+                        error: null,
+                    });
+                }
+                if (status === 'auto') {
+                    await host.reconcileRoleBatch(batch, validationOptions());
+                    applyArchiveSkips(batch, getSettings().roleArchive, getSettings().roleImageLibrary?.workNames);
+                }
                 if (host.snapshot().identity !== batch.identity) throw new Error('聊天已切换，请返回原聊天');
                 batch.index = nextRoleIndex(batch);
                 checkpoint();
             } catch (error) {
                 Object.assign(batch, previous);
+                settings.roleArchive = previousArchive;
+                onRoleArchiveChange();
                 throw error;
             } finally {
                 preparing = false;

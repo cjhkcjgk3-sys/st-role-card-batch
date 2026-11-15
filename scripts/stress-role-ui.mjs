@@ -149,7 +149,18 @@ try {
                 const expandedRows = rowCount();
                 const expandedRefresh = await measure(() => $('#nag-set-export-all').trigger('change'));
                 const archiveExpand = await measure(() => $('#nag-archive-more').trigger('click'), 4);
-                const archiveDelete = await measure(() => document.querySelector('.nag-archive-remove')?.click(), 3);
+                const archiveDelete = await measure(async () => {
+                    const row = document.querySelector('.nag-archive-row');
+                    const removed = row?.querySelector('.nag-archive-name')?.textContent;
+                    row?.querySelector('.nag-archive-remove')?.click();
+                    for (let tick = 0; tick < 20; tick++) await Promise.resolve();
+                    const item = window.fixture.roleBatch.items.find((entry) => entry.name === removed);
+                    if (
+                        removed &&
+                        (item?.processed !== false || item.failed || item.manualStatus !== null || item.archived)
+                    )
+                        throw new Error(`Archive deletion did not return ${removed} to the queue`);
+                }, 3);
                 // rAF gaps include painting/scheduling; scrolling setters alone do not measure smoothness.
                 const gaps = [];
                 let lastFrame = await new Promise((done) => requestAnimationFrame(done));
@@ -177,6 +188,7 @@ try {
                         throw new Error('Wrong cross-page correction target');
                     const removed = document.querySelector('.nag-archive-name').textContent;
                     document.querySelector('.nag-archive-remove').click();
+                    for (let i = 0; i < 20; i++) await Promise.resolve();
                     $('#nag-role-rows-prev').trigger('click');
                     const index = Number(document.querySelector('.nag-role-status-set').dataset.index);
                     if (index !== target - 100) throw new Error('Previous page index mismatch');

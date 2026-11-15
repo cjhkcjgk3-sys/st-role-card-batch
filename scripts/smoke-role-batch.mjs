@@ -17,21 +17,47 @@ try {
     const page = await browser.newPage();
     page.setDefaultTimeout(15000);
     const restartBatch = async () => {
+        await page.waitForFunction(() => {
+            const button = document.getElementById('nag-btn-restart-role');
+            return button && !button.disabled;
+        });
         await page.evaluate(() => document.getElementById('nag-btn-restart-role').click());
-        await page
-            .locator('dialog[open]')
-            .filter({ hasText: '从头生成全部角色' })
-            .last()
-            .locator('.popup-button-ok')
-            .dispatchEvent('click');
+        const dialog = page.locator('dialog[open]').filter({ hasText: '从头生成全部角色' }).last();
+        await dialog.waitFor({ state: 'visible' });
+        await dialog.locator('.popup-button-ok').dispatchEvent('click');
+        await page.waitForFunction(() => {
+            const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
+            const recovery = JSON.parse(localStorage.getItem('novel-auto-generator:role-batch:v1') || 'null');
+            return !settings.roleBatch && recovery?.cleared === true;
+        });
+    };
+    const startAndWait = async () => {
+        const previousRevision = await page.evaluate(
+            () => window.SillyTavern.getContext().extensionSettings['novel-auto-generator'].roleBatch?.revision ?? -1,
+        );
+        await page.evaluate(() => window.jQuery('#nag-btn-start').triggerHandler('click'));
         await page.waitForFunction(
-            () => !window.SillyTavern.getContext().extensionSettings['novel-auto-generator'].roleBatch,
+            (revision) => {
+                const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
+                const start = document.getElementById('nag-btn-start');
+                return (
+                    settings.roleBatch &&
+                    settings.roleBatch.revision > revision &&
+                    !settings.isRunning &&
+                    start &&
+                    !start.disabled
+                );
+            },
+            previousRevision,
+            { timeout: 60000 },
         );
     };
-    const resetKeep = () =>
-        page.evaluate(async () => {
+    const resetKeep = async () => {
+        await page.evaluate(async () => {
             await window.jQuery('#nag-btn-reset').triggerHandler('click');
         });
+        await page.waitForFunction(() => !document.getElementById('nag-btn-reset')?.disabled);
+    };
     const connect = async () => {
         await page.locator('#api_button_openai').dispatchEvent('click');
         await page.waitForFunction(() => window.SillyTavern.getContext().onlineStatus !== 'no_connection');
@@ -327,7 +353,8 @@ try {
         })) {
             const node = document.getElementById(id);
             node.value = value;
-            node.dispatchEvent(new Event('change'));
+            if (id === 'nag-set-prompt') node.dispatchEvent(new Event('input', { bubbles: true }));
+            node.dispatchEvent(new Event('change', { bubbles: true }));
         }
     });
     // Each run starts with ordinary rendering; the isolation matrix enables its own switch.
@@ -348,26 +375,16 @@ try {
         process.exit(0);
     }
     await page.evaluate(() => window.SillyTavern.getContext().stopGeneration());
-    await page.evaluate(() => document.getElementById('nag-btn-start').click());
-    await page
-        .waitForFunction(
-            () => {
-                const settings = SillyTavern.getContext().extensionSettings['novel-auto-generator'];
-                return !settings.isRunning;
-            },
-            null,
-            { timeout: 60000 },
-        )
-        .catch(async (error) => {
-            console.error(
-                await page.evaluate(() => ({
-                    progress: document.getElementById('nag-progress-text').textContent,
-                    statuses: document.getElementById('nag-role-results').textContent,
-                    notices: document.querySelector('#toast-container')?.textContent,
-                })),
-            );
-            throw error;
-        });
+    await startAndWait().catch(async (error) => {
+        console.error(
+            await page.evaluate(() => ({
+                progress: document.getElementById('nag-progress-text').textContent,
+                statuses: document.getElementById('nag-role-results').textContent,
+                notices: document.querySelector('#toast-container')?.textContent,
+            })),
+        );
+        throw error;
+    });
     const result = await page.evaluate(() => {
         const c = SillyTavern.getContext();
         return {
@@ -407,6 +424,171 @@ try {
         await browser.close();
         process.exit(0);
     }
+    if (process.env.SMOKE_ARCHIVE_ONLY === '1') {
+        await page.locator('#nag-role-correction-toggle').dispatchEvent('click');
+        await page
+            .locator('#nag-role-results .nag-role-status-set[data-index="0"][data-status="failed"]')
+            .dispatchEvent('click');
+        await page.waitForFunction(() => {
+            const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
+            return (
+                settings.roleBatch?.items[0]?.manualStatus === 'failed' &&
+                settings.roleBatch.items[0].failed &&
+                !settings.roleArchive.includes('角色甲') &&
+                !settings.isRunning
+            );
+        });
+        assert.ok((await page.locator('#nag-role-results').textContent()).includes('❌'));
+        await startAndWait();
+        assert.equal(requests.length, 4, 'Manual failure retries despite the old archive entry');
+        assert.equal(
+            await page.evaluate(() => {
+                const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
+                const item = settings.roleBatch.items[0];
+                return (
+                    item.processed &&
+                    !item.failed &&
+                    item.manualStatus === null &&
+                    settings.roleArchive.includes('角色甲')
+                );
+            }),
+            true,
+        );
+
+        const archiveIndex = await page.evaluate(() =>
+            window.SillyTavern.getContext().extensionSettings['novel-auto-generator'].roleArchive.indexOf('角色甲'),
+        );
+        await page
+            .locator(`#nag-archive-list .nag-archive-remove[data-index="${archiveIndex}"]`)
+            .dispatchEvent('click');
+        await page.waitForFunction(() => {
+            const item = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'].roleBatch.items[0];
+            return item.processed === false && item.failed === false && item.manualStatus === null && !item.archived;
+        });
+        assert.ok(
+            (await page.locator('#nag-role-results').locator('.ttw-memory-item').nth(0).textContent()).includes('⏳'),
+        );
+        const repliesBeforeDeleteRetry = await page.evaluate(() => ({
+            floors: window.SillyTavern.getContext().chat.length,
+            swipes: [...window.SillyTavern.getContext().chat[2].swipes],
+        }));
+        await startAndWait();
+        assert.equal(requests.length, 5, 'Deleting a generated name requeues it without removing its old reply');
+        const repliesAfterDeleteRetry = await page.evaluate(() => ({
+            floors: window.SillyTavern.getContext().chat.length,
+            swipes: window.SillyTavern.getContext().chat[2].swipes,
+        }));
+        assert.equal(repliesAfterDeleteRetry.floors, repliesBeforeDeleteRetry.floors);
+        assert.equal(repliesAfterDeleteRetry.swipes.length, repliesBeforeDeleteRetry.swipes.length + 1);
+        assert.deepEqual(
+            repliesAfterDeleteRetry.swipes.slice(0, repliesBeforeDeleteRetry.swipes.length),
+            repliesBeforeDeleteRetry.swipes,
+        );
+
+        const chatBeforeClear = await page.evaluate(() => ({
+            floors: window.SillyTavern.getContext().chat.length,
+            swipes: [...window.SillyTavern.getContext().chat[2].swipes],
+        }));
+        await page.locator('#nag-btn-archive-clear').dispatchEvent('click');
+        const cancelDialog = page.locator('dialog[open]').filter({ hasText: '清空已完成角色名录' }).last();
+        await cancelDialog.waitFor();
+        assert.ok((await cancelDialog.textContent()).includes('已生成的角色会改为待生成，不会删除角色卡或回复'));
+        const beforeCancel = await page.evaluate(() => {
+            const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
+            return { archive: [...settings.roleArchive], items: structuredClone(settings.roleBatch.items) };
+        });
+        await cancelDialog.locator('.popup-button-cancel').dispatchEvent('click');
+        await page.waitForFunction(() => !document.querySelector('dialog[open]'));
+        assert.deepEqual(
+            await page.evaluate(() => {
+                const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
+                return { archive: settings.roleArchive, items: settings.roleBatch.items };
+            }),
+            beforeCancel,
+        );
+        await page.locator('#nag-btn-archive-clear').dispatchEvent('click');
+        const confirmDialog = page.locator('dialog[open]').filter({ hasText: '清空已完成角色名录' }).last();
+        await confirmDialog.waitFor();
+        await confirmDialog.locator('.popup-button-ok').dispatchEvent('click');
+        await page.waitForFunction(() => {
+            const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
+            return (
+                settings.roleArchive.length === 0 &&
+                settings.roleBatch.items.every(
+                    (item) => item.processed === false && item.failed === false && item.manualStatus === null,
+                )
+            );
+        });
+        assert.deepEqual(
+            await page.evaluate(() => ({
+                floors: window.SillyTavern.getContext().chat.length,
+                swipes: window.SillyTavern.getContext().chat[2].swipes,
+            })),
+            chatBeforeClear,
+            'Clearing the archive changes task state only',
+        );
+        await startAndWait();
+        assert.equal(requests.length, 8, 'Clearing the archive reruns every linked completed role');
+
+        const setRoster = (names) =>
+            page.evaluate((names) => {
+                const prompt = document.getElementById('nag-set-prompt');
+                prompt.value = names.join('\n');
+                prompt.dispatchEvent(new Event('input', { bubbles: true }));
+                prompt.dispatchEvent(new Event('change', { bubbles: true }));
+            }, names);
+        await page
+            .locator('#nag-role-results .nag-role-status-set[data-index="0"][data-status="failed"]')
+            .dispatchEvent('click');
+        await page.waitForFunction(() => {
+            const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
+            return settings.roleBatch.items[0].manualStatus === 'failed' && !settings.roleArchive.includes('角色甲');
+        });
+        await setRoster(['角色甲', '角色乙', '角色丙', '名录跳过']);
+        await page.waitForFunction(() =>
+            window.SillyTavern.getContext().extensionSettings['novel-auto-generator'].roleBatch.names.includes(
+                '名录跳过',
+            ),
+        );
+        await page.evaluate(() => {
+            const input = document.getElementById('nag-archive-input');
+            input.value = '角色甲\n名录跳过';
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        await page.locator('#nag-btn-archive-add').dispatchEvent('click');
+        await page.waitForFunction(() => {
+            const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
+            return settings.roleArchive.includes('角色甲') && settings.roleArchive.includes('名录跳过');
+        });
+        assert.equal(
+            await page.evaluate(() => {
+                const item =
+                    window.SillyTavern.getContext().extensionSettings['novel-auto-generator'].roleBatch.items[0];
+                return item.manualStatus === 'failed' && item.failed;
+            }),
+            true,
+            'Adding an archive match cannot override a manual failure',
+        );
+        await startAndWait();
+        assert.equal(
+            requests.length,
+            9,
+            'Start retries the manual failure and skips only the unprocessed archive item',
+        );
+        const finalItems = await page.evaluate(
+            () => window.SillyTavern.getContext().extensionSettings['novel-auto-generator'].roleBatch.items,
+        );
+        assert.equal(finalItems[0].manualStatus, null);
+        assert.equal(finalItems[3].archived, true);
+        assert.equal(finalItems[3].processed, true);
+        assert.ok(!JSON.stringify(requests.at(-1).messages).includes('名录跳过'));
+        assert.deepEqual(errors, []);
+        console.log(
+            JSON.stringify({ passed: true, host: 'SillyTavern', archiveWorkflow: true, requests: requests.length }),
+        );
+        await browser.close();
+        process.exit(0);
+    }
     emptyReplies = true;
     await restartBatch();
     await page.evaluate(() => {
@@ -416,18 +598,11 @@ try {
         })) {
             const node = document.getElementById(id);
             node.value = value;
-            node.dispatchEvent(new Event('change'));
+            if (id === 'nag-set-prompt') node.dispatchEvent(new Event('input', { bubbles: true }));
+            node.dispatchEvent(new Event('change', { bubbles: true }));
         }
-        document.getElementById('nag-btn-start').click();
     });
-    await page.waitForFunction(
-        () => {
-            const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
-            return settings.roleBatch?.items[0]?.failed && !settings.isRunning;
-        },
-        null,
-        { timeout: 30000 },
-    );
+    await startAndWait();
     const failure = await page.evaluate(
         () => window.SillyTavern.getContext().extensionSettings['novel-auto-generator'].roleBatch,
     );
@@ -442,12 +617,7 @@ try {
     emptyReplies = false;
     streamError = true;
     await restartBatch();
-    await page.evaluate(() => document.getElementById('nag-btn-start').click());
-    await page.waitForFunction(
-        () => !window.SillyTavern.getContext().extensionSettings['novel-auto-generator'].isRunning,
-        null,
-        { timeout: 30000 },
-    );
+    await startAndWait();
     const streamFailure = await page.evaluate(
         () => window.SillyTavern.getContext().extensionSettings['novel-auto-generator'].roleBatch,
     );
@@ -493,22 +663,25 @@ try {
     await page.waitForFunction(
         () => !window.SillyTavern.getContext().extensionSettings['novel-auto-generator'].isRunning,
     );
-    await resetKeep();
     await page.waitForFunction(
-        () => !window.SillyTavern.getContext().extensionSettings['novel-auto-generator'].roleBatch?.pending,
+        () => {
+            const stop = document.querySelector('#mes_stop');
+            return !stop || getComputedStyle(stop).display === 'none';
+        },
+        null,
+        { timeout: 30000 },
     );
+    // Restart clears the uncertain stopped request without reconciling its aborted candidate.
+    await restartBatch();
     await page.evaluate(() => {
         for (const [id, value] of Object.entries({ 'nag-set-total': '1', 'nag-set-prompt': '停止后重新开始' })) {
             const element = document.getElementById(id);
             element.value = value;
-            element.dispatchEvent(new Event('change'));
+            if (id === 'nag-set-prompt') element.dispatchEvent(new Event('input', { bubbles: true }));
+            element.dispatchEvent(new Event('change', { bubbles: true }));
         }
-        document.getElementById('nag-btn-start').click();
     });
-    await page.waitForFunction(() => {
-        const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
-        return !settings.isRunning;
-    });
+    await startAndWait();
     const restarted = await page.evaluate(
         () => window.SillyTavern.getContext().extensionSettings['novel-auto-generator'],
     );
@@ -550,13 +723,10 @@ try {
             })) {
                 const element = document.getElementById(id);
                 element.value = value;
-                element.dispatchEvent(new Event('change'));
+                if (id === 'nag-set-prompt') element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
             }
         }, names);
-    const startAndWait = () =>
-        page.evaluate(async () => {
-            await window.jQuery('#nag-btn-start').triggerHandler('click');
-        });
     await resetKeep();
     await startAndWait();
     assert.equal(requests.length, 11, JSON.stringify({ initialRecovery, saves: saves.slice(-8) }));
@@ -684,6 +854,106 @@ try {
     await setNames(['恢复甲', '恢复乙', '恢复丙']);
     await startAndWait();
     assert.equal(requests.length, 19, 'Only an explicit confirmed restart regenerates all roles');
+    await page.locator('#nag-role-correction-toggle').dispatchEvent('click');
+    await page
+        .locator('#nag-role-results .nag-role-status-set[data-index="0"][data-status="failed"]')
+        .dispatchEvent('click');
+    await page.waitForFunction(() => {
+        const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
+        const item = settings.roleBatch?.items.find((entry) => entry.name === '恢复甲');
+        return (
+            item?.manualStatus === 'failed' &&
+            item.failed &&
+            !settings.roleArchive.includes('恢复甲') &&
+            !settings.isRunning
+        );
+    });
+    assert.equal(
+        await page.evaluate(() =>
+            window.SillyTavern.getContext().extensionSettings['novel-auto-generator'].roleArchive.includes('恢复甲'),
+        ),
+        false,
+        'A manual failure removes the matching archive name',
+    );
+    assert.ok((await page.locator('#nag-role-results').textContent()).includes('❌'));
+    await startAndWait();
+    assert.equal(requests.length, 20, 'A manual failure overrides the matching archive entry and retries');
+    assert.ok(
+        await page.evaluate(() => {
+            const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
+            return settings.roleBatch.items.find((entry) => entry.name === '恢复甲')?.manualStatus === null;
+        }),
+    );
+    const archivedIndex = await page.evaluate(() =>
+        window.SillyTavern.getContext().extensionSettings['novel-auto-generator'].roleArchive.indexOf('恢复甲'),
+    );
+    assert.ok(archivedIndex >= 0, 'The generated role is present in the completed-role archive');
+    await page.locator(`#nag-archive-list .nag-archive-remove[data-index="${archivedIndex}"]`).dispatchEvent('click');
+    await page.waitForFunction(() => {
+        const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
+        const item = settings.roleBatch?.items.find((entry) => entry.name === '恢复甲');
+        return (
+            item?.processed === false &&
+            item.failed === false &&
+            item.manualStatus === null &&
+            !item.archived &&
+            !settings.roleArchive.includes('恢复甲') &&
+            !settings.isRunning
+        );
+    });
+    assert.equal(
+        await page.evaluate(() =>
+            window.SillyTavern.getContext().extensionSettings['novel-auto-generator'].roleArchive.includes('恢复甲'),
+        ),
+        false,
+    );
+    assert.ok((await page.locator('#nag-role-results').textContent()).includes('⏳'));
+    await startAndWait();
+    assert.equal(requests.length, 21, 'Deleting an archive entry updates status and requeues its role');
+    const chatBeforeArchiveClear = await page.evaluate(() => {
+        const message = window.SillyTavern.getContext().chat[2];
+        return { floors: window.SillyTavern.getContext().chat.length, swipes: message?.swipes?.length };
+    });
+    await page.locator('#nag-btn-archive-clear').dispatchEvent('click');
+    const clearDialog = page.locator('dialog[open]').filter({ hasText: '清空已完成角色名录' }).last();
+    await clearDialog.waitFor();
+    const clearPrompt = await clearDialog.textContent();
+    assert.ok(clearPrompt.includes('已生成的角色会改为待生成，不会删除角色卡或回复'), clearPrompt);
+    const archiveBeforeCancel = await page.evaluate(() => {
+        const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
+        return { archive: [...settings.roleArchive], items: structuredClone(settings.roleBatch.items) };
+    });
+    await clearDialog.locator('.popup-button-cancel').dispatchEvent('click');
+    await page.waitForFunction(() => !document.querySelector('dialog[open]'));
+    assert.deepEqual(
+        await page.evaluate(() => {
+            const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
+            return { archive: settings.roleArchive, items: settings.roleBatch.items };
+        }),
+        archiveBeforeCancel,
+        'Cancelling archive clear changes no archive or task status',
+    );
+    await page.locator('#nag-btn-archive-clear').dispatchEvent('click');
+    const confirmedClearDialog = page.locator('dialog[open]').filter({ hasText: '清空已完成角色名录' }).last();
+    await confirmedClearDialog.waitFor();
+    await confirmedClearDialog.locator('.popup-button-ok').dispatchEvent('click');
+    await page.waitForFunction(() => {
+        const settings = window.SillyTavern.getContext().extensionSettings['novel-auto-generator'];
+        return (
+            settings.roleArchive.length === 0 &&
+            settings.roleBatch?.items.every(
+                (item) =>
+                    item.processed === false && item.failed === false && item.manualStatus === null && !item.archived,
+            )
+        );
+    });
+    const chatAfterArchiveClear = await page.evaluate(() => {
+        const message = window.SillyTavern.getContext().chat[2];
+        return { floors: window.SillyTavern.getContext().chat.length, swipes: message?.swipes?.length };
+    });
+    assert.deepEqual(chatAfterArchiveClear, chatBeforeArchiveClear, 'Clearing the archive leaves chat replies intact');
+    await startAndWait();
+    assert.equal(requests.length, 24, 'Clearing the archive requeues all completed roles in the linked batch');
     assert.deepEqual(errors, []);
     const isolation =
         process.env.SMOKE_ISOLATION === '1'
@@ -715,6 +985,9 @@ try {
             reloadResume: true,
             staleProgressReconciled: true,
             editedNamesPreserveCompleted: true,
+            manualFailureRequeued: true,
+            archiveDeletionRequeued: true,
+            archiveClearRequeuedWithoutDeletingReplies: true,
             isolation,
             model: 'intercepted synthetic responses; no paid model calls',
         }),

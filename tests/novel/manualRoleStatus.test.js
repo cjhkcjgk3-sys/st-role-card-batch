@@ -29,6 +29,10 @@ function fixture() {
             saved = structuredClone(value);
         },
     };
+    const onRoleComplete = vi.fn((name) => {
+        settings.roleArchive ??= [];
+        if (!settings.roleArchive.includes(name)) settings.roleArchive.push(name);
+    });
     const runner = createRoleBatchRunner({
         getSettings: () => settings,
         host,
@@ -36,8 +40,9 @@ function fixture() {
         notify: vi.fn(),
         onChange: vi.fn(),
         onStats: vi.fn(),
+        onRoleComplete,
     });
-    return { batch, settings, host, runner, saved: () => saved };
+    return { batch, settings, host, runner, onRoleComplete, saved: () => saved };
 }
 
 it('persists a manual failure across name removal and re-addition and sends only that role', async () => {
@@ -59,9 +64,67 @@ it('supports manual completion and returning the role to automatic judgment', as
     await f.runner.setRoleStatus(1, 'complete');
     expect(roleComplete(f.batch.items[1])).toBe(true);
     expect(f.saved().items[1].manualStatus).toBe('complete');
+    expect(f.settings.roleArchive).toContain('乙');
+    expect(f.onRoleComplete).toHaveBeenCalledWith('乙');
     await f.runner.setRoleStatus(1, 'auto');
     expect(f.batch.items[1].manualStatus).toBeNull();
     expect(roleComplete(f.batch.items[1])).toBe(true);
+});
+
+it('keeps a manual failure queued when the old archive still contains the role', async () => {
+    const f = fixture();
+    f.settings.roleArchive = ['乙'];
+    await f.runner.setRoleStatus(1, 'failed');
+    expect(f.batch.items[1]).toMatchObject({ failed: true, manualStatus: 'failed', archived: false });
+    expect(f.settings.roleArchive).toEqual([]);
+
+    await f.runner.start();
+    expect(f.host.generateRoleReply).toHaveBeenCalledTimes(1);
+    expect(f.host.generateRoleReply.mock.calls[0][1]).toBe('写 乙');
+});
+
+it('releases a deleted archive role as a queued item', async () => {
+    const f = fixture();
+    f.settings.roleArchive = ['乙'];
+    await f.runner.setRoleArchive([]);
+    expect(f.settings.roleArchive).toEqual([]);
+    expect(f.batch.items[1]).toMatchObject({ processed: false, failed: false, manualStatus: null, archived: false });
+    expect(f.batch.index).toBe(1);
+    expect(f.saved().items[1]).toMatchObject({ processed: false, failed: false, manualStatus: null });
+});
+
+it('clearing the archive requeues every linked completed role without touching chat pages', async () => {
+    const f = fixture();
+    f.settings.roleArchive = ['甲', '乙'];
+    await f.runner.setRoleArchive([]);
+    expect(f.settings.roleArchive).toEqual([]);
+    expect(f.batch.items[0]).toMatchObject({ processed: false, failed: false, manualStatus: null });
+    expect(f.batch.items[1]).toMatchObject({ processed: false, failed: false, manualStatus: null });
+    expect(f.batch.items[2]).toMatchObject({ processed: true, failed: false });
+    expect(f.batch.index).toBe(0);
+    expect(f.host.generateRoleReply).not.toHaveBeenCalled();
+});
+
+it('rolls back the archive and linked task status when its recovery checkpoint fails', async () => {
+    const f = fixture();
+    f.settings.roleArchive = ['乙'];
+    const runner = createRoleBatchRunner({
+        getSettings: () => f.settings,
+        host: f.host,
+        recovery: {
+            read: () => null,
+            write: () => {
+                throw new Error('full');
+            },
+        },
+        notify: vi.fn(),
+        onChange: vi.fn(),
+        onStats: vi.fn(),
+    });
+    await expect(runner.setRoleArchive([])).rejects.toThrow('无法保存');
+    expect(f.settings.roleArchive).toEqual(['乙']);
+    expect(f.batch.items[1]).toMatchObject({ processed: true, failed: false });
+    expect(f.batch.items[1].manualStatus).toBeUndefined();
 });
 
 it('rolls back a manual edit if the recovery journal cannot save it', async () => {

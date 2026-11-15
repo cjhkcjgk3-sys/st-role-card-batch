@@ -2,12 +2,15 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { createRoleBatchRunner, parseRoleNames } from '../../src/novel/roleBatch.js';
 import {
     applyArchiveSkips,
+    applyRoleArchiveChanges,
     countUnidentifiedRolePages,
     dedupeRoleArchive,
     duplicateRoleNames,
     mergeRoleArchive,
     normalizeRoleArchive,
     removeRoleArchiveName,
+    removeRoleArchiveMatches,
+    resolveRoleStatus,
     unidentifiedRolePageSignature,
 } from '../../src/novel/roleBatchState.js';
 
@@ -154,6 +157,38 @@ it('normalizes the finished-role archive by trimmed unique names', () => {
     expect(removeRoleArchiveName(undefined, '琴')).toEqual([]);
 });
 
+it('resolves manual, batch, archive and queued state in the same precedence order', () => {
+    expect(resolveRoleStatus({ manualStatus: 'failed', processed: true, failed: false }, true)).toMatchObject({
+        status: 'failed',
+        complete: false,
+        manual: true,
+        archived: false,
+    });
+    expect(resolveRoleStatus({ processed: true, failed: true }, true)).toMatchObject({
+        status: 'failed',
+        complete: false,
+        source: 'batch',
+    });
+    expect(resolveRoleStatus({ processed: true, failed: false }, true)).toMatchObject({
+        status: 'complete',
+        complete: true,
+        source: 'batch',
+    });
+    expect(resolveRoleStatus({ processed: false, failed: false }, true)).toMatchObject({
+        status: 'complete',
+        complete: true,
+        archived: true,
+        source: 'archive',
+    });
+    expect(resolveRoleStatus({})).toMatchObject({ status: 'queued', complete: false, source: 'queue' });
+});
+
+it('removes a manually failed archive role without deleting the same name from another work', () => {
+    expect(
+        removeRoleArchiveMatches(['最终幻想7·蒂法', '最终幻想8·蒂法'], '最终幻想7·蒂法', ['最终幻想7', '最终幻想8']),
+    ).toEqual(['最终幻想8·蒂法']);
+});
+
 it('stores a role once even when it is written with and without the work name', () => {
     // 收录时也按「同一个角色」判断，避免名录里出现两条
     expect(mergeRoleArchive(['南达科他'], ['碧蓝航线·南达科他'], ['碧蓝航线'])).toEqual(['南达科他']);
@@ -192,8 +227,94 @@ it('marks archived names as finished and releases them once deleted from the arc
     expect(batch.index).toBe(1);
     expect(applyArchiveSkips(batch, [])).toEqual([]);
     expect(batch.items[0].archived).toBe(false);
-    expect(batch.items[0].processed).toBe(false);
+    expect(batch.items[0]).toMatchObject({ processed: false, failed: false });
+    expect(batch.items[0].manualStatus).toBeNull();
     expect(batch.index).toBe(0);
+});
+
+it('synchronizes archive edits with task status and requeues deleted roles', () => {
+    const batch = {
+        id: 'b',
+        names: ['琴', '安柏'],
+        index: 2,
+        items: [
+            { id: 'a', name: '琴', processed: true, failed: false },
+            { id: 'b', name: '安柏', archived: true, processed: true, failed: false },
+        ],
+        history: [],
+    };
+    expect(applyRoleArchiveChanges(batch, ['琴', '安柏'], ['琴'])).toMatchObject({ added: [], removed: ['安柏'] });
+    expect(batch.items[1]).toMatchObject({
+        archived: false,
+        processed: false,
+        failed: false,
+        manualStatus: null,
+    });
+    expect(batch.index).toBe(1);
+
+    expect(applyRoleArchiveChanges(batch, ['琴'], ['琴', '安柏'])).toMatchObject({ added: ['安柏'], removed: [] });
+    expect(batch.items[1]).toMatchObject({ archived: true, processed: true, failed: false, manualStatus: null });
+    expect(batch.index).toBe(2);
+});
+
+it('does not let a manual failure be promoted by an unchanged archive during queue preparation', () => {
+    const batch = {
+        names: ['琴'],
+        items: [{ id: 'a', name: '琴', processed: true, failed: true, manualStatus: 'failed' }],
+        history: [],
+    };
+    expect(applyArchiveSkips(batch, ['琴'])).toEqual([]);
+    expect(batch.items[0]).toMatchObject({ processed: true, failed: true, manualStatus: 'failed' });
+    expect(batch.index).toBe(0);
+});
+
+it('clears stale archive metadata without replacing generated or manual failures', () => {
+    const batch = {
+        names: ['生成失败', '手动失败', '已生成'],
+        items: [
+            { id: 'a', name: '生成失败', archived: true, processed: true, failed: true },
+            { id: 'b', name: '手动失败', archived: true, processed: true, failed: true, manualStatus: 'failed' },
+            { id: 'c', name: '已生成', archived: true, processed: true, failed: false, swipe: 2 },
+        ],
+        history: [],
+    };
+    applyArchiveSkips(batch, []);
+    expect(batch.items[0]).toMatchObject({ archived: false, processed: true, failed: true });
+    expect(batch.items[1]).toMatchObject({ archived: false, processed: true, failed: true, manualStatus: 'failed' });
+    expect(batch.items[2]).toMatchObject({ archived: false, processed: true, failed: false, swipe: 2 });
+});
+
+it('does not let adding an archive entry replace a manual or generated failure', () => {
+    const batch = {
+        names: ['手动失败', '生成失败', '排队'],
+        items: [
+            { id: 'a', name: '手动失败', processed: true, failed: true, manualStatus: 'failed' },
+            { id: 'b', name: '生成失败', processed: true, failed: true },
+            { id: 'c', name: '排队' },
+        ],
+        history: [],
+    };
+    applyRoleArchiveChanges(batch, [], ['手动失败', '生成失败', '排队']);
+    expect(batch.items[0]).toMatchObject({ processed: true, failed: true, manualStatus: 'failed' });
+    expect(batch.items[1]).toMatchObject({ processed: true, failed: true });
+    expect(batch.items[2]).toMatchObject({ archived: true, processed: true, failed: false });
+});
+
+it('only archive-skips unprocessed roles, preserving generated failures and completions', () => {
+    const batch = {
+        names: ['甲', '乙', '丙'],
+        items: [
+            { id: 'a', name: '甲', processed: true, failed: true },
+            { id: 'b', name: '乙', processed: true, failed: false },
+            { id: 'c', name: '丙', processed: false, failed: false },
+        ],
+        history: [],
+    };
+    expect(applyArchiveSkips(batch, ['甲', '乙', '丙'])).toEqual(['丙']);
+    expect(batch.items[0]).toMatchObject({ processed: true, failed: true });
+    expect(batch.items[0].archived).not.toBe(true);
+    expect(batch.items[1]).toMatchObject({ processed: true, failed: false });
+    expect(batch.items[2]).toMatchObject({ processed: true, failed: false, archived: true });
 });
 
 it('treats a name written with and without the work name as the same archived role', () => {

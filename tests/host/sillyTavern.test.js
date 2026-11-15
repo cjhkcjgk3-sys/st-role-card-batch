@@ -396,6 +396,30 @@ it('does not adopt partial or unmarked text and repairs moved or deleted complet
     expect(batch.items[0].processed).toBe(false);
 });
 
+it('keeps an explicitly requeued task pending while retaining its old reply and receipt', async () => {
+    const { host, context } = batchSetup();
+    context.chat[2].swipes = ['旧成品'];
+    context.chat[2].swipe_info = [
+        {
+            extra: {
+                nag_role_batch: { taskId: 'task-1', itemId: 'role-1', attemptId: 'old-attempt', status: 'complete' },
+            },
+        },
+    ];
+    const batch = {
+        ...host.prepareRoleBatch(),
+        id: 'task-1',
+        identity: host.snapshot().identity,
+        names: ['琴'],
+        items: [{ id: 'role-1', name: '琴', processed: false, failed: false, swipe: null }],
+        pending: false,
+    };
+    await host.reconcileRoleBatch(batch);
+    expect(batch.items[0]).toMatchObject({ processed: false, failed: false, swipe: null });
+    expect(context.chat[2].swipes).toEqual(['旧成品']);
+    expect(context.chat[2].swipe_info[0].extra.nag_role_batch.attemptId).toBe('old-attempt');
+});
+
 it('retains a failed result when an old complete receipt has text that fails the same validation used at generation', async () => {
     const { host, context } = batchSetup();
     const invalid = '<card>有正文但没有闭合的角色卡。';
