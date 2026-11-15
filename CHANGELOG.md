@@ -12,6 +12,7 @@
 - 角色名单列表自带样式收回到 `style.css`，外观不变。
 - 测试从 549 个精简到 270 个，全部针对写卡；`npm run verify` 增加名字一致性检查。
 - 扩展入口函数更名为 `enableRoleExtension` / `disposeRoleExtension`。
+- 修名录逐条收录的 O(n²)：匹配器支持增量添加（二分插入），1000 个角色从 4.2 秒降到 28 ms，5000 个从 136 秒降到 117 ms。新增 `npm run stress:flow` 压测脚本。
 - 设置键仍是 `novel-auto-generator`，从旧版本升级不丢名单、名录、图片库和配置。
 
 ## 1.16.0

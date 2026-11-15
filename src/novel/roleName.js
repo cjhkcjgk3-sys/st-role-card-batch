@@ -114,8 +114,36 @@ export function createRoleNameMatcher(names, workNames = []) {
     }
     // A suffix of a name becomes a prefix of its reversal. Store one string per name,
     // rather than allocating every suffix (quadratic character storage for long names).
+    // 反转名保持有序：新增时按二分位置插入，避免每次收录都整表重排
     const sortedNames = [...reversedNames].sort();
+    const insertSorted = (value) => {
+        let low = 0;
+        let high = sortedNames.length;
+        while (low < high) {
+            const middle = (low + high) >> 1;
+            if (sortedNames[middle] < value) low = middle + 1;
+            else high = middle;
+        }
+        sortedNames.splice(low, 0, value);
+    };
     return {
+        /** 增量收录一个名字：名录逐个增长时避免每次重建整个匹配器（O(n²)）。 */
+        add(value) {
+            const name = String(value ?? '').trim();
+            if (!name) return;
+            const parsed = parseWithWorkKeys(name, workKeys);
+            const compactName = compact(name);
+            if (compactName.length > 1) {
+                const reversed = reverseName(compactName);
+                if (!reversedNames.has(reversed)) {
+                    reversedNames.add(reversed);
+                    insertSorted(reversed);
+                }
+            }
+            if (!parsed.key) return;
+            if (!byKey.has(parsed.key)) byKey.set(parsed.key, new Set());
+            byKey.get(parsed.key).add(parsed.work);
+        },
         /** 名录里是否已经有这个角色（任一可接受写法都算）。 */
         has(value) {
             const name = String(value ?? '').trim();

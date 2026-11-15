@@ -15,7 +15,9 @@
     "typecheck": "tsc -p tsconfig.json",
     "check:boundaries": "node scripts/check-boundaries.mjs",
     "verify": "npm run lint && npm run format:check && npm run typecheck && npm run check:boundaries && npm run check:names && npm test",
-    "check:names": "node scripts/name-consistency.mjs"
+    "check:names": "node scripts/name-consistency.mjs",
+    "stress:flow": "node scripts/stress-role-flow.mjs",
+    "bench:scale": "node scripts/benchmark-role-scale.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.23.0",

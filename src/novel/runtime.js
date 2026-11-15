@@ -612,7 +612,12 @@ export function initNovelUI(host) {
         },
         onRoleComplete: (name) => {
             // onChange/saveSettings follows every checkpoint, so this is persisted with the batch.
-            settings.roleArchive = mergeRoleArchive(settings.roleArchive, [name], settings.roleImageLibrary?.workNames);
+            // 用缓存的匹配器判断是否已收录，命中就增量更新，避免每次重建（O(n²)）。
+            const archive = normalizeRoleArchive(settings.roleArchive);
+            const matcher = getArchiveMatcher(archive, settings.roleImageLibrary?.workNames);
+            if (matcher.has(name)) return;
+            settings.roleArchive = [...archive, name];
+            rememberArchiveName(name);
         },
     });
     let imageSkipNoticeBatch = null;
@@ -1202,11 +1207,25 @@ export function initNovelUI(host) {
     let archiveMatcherCache = null;
     function getArchiveMatcher(names, workNames) {
         const workKey = Array.isArray(workNames) ? workNames.join('\u0000') : '';
-        const key = names.join('\u0000') + '\u0001' + workKey;
-        if (archiveMatcherCache?.key === key) return archiveMatcherCache.matcher;
+        const cached = archiveMatcherCache;
+        if (
+            cached &&
+            cached.workKey === workKey &&
+            cached.names.length === names.length &&
+            cached.names.every((name, index) => name === names[index])
+        )
+            return cached.matcher;
         const matcher = createRoleNameMatcher(names, workNames);
-        archiveMatcherCache = { key, matcher };
+        archiveMatcherCache = { names: [...names], workKey, matcher };
         return matcher;
+    }
+
+    /** 收录成功后增量更新缓存，避免每完成一个角色就重建整个匹配器。 */
+    function rememberArchiveName(name) {
+        const cached = archiveMatcherCache;
+        if (!cached) return;
+        cached.names.push(name);
+        cached.matcher.add(name);
     }
 
     // 列表分页：只保留当前页的行，翻页后不累积 DOM。

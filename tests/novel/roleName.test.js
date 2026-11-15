@@ -54,6 +54,21 @@ describe('createRoleNameMatcher', () => {
         expect(matcher.has('安比（改）')).toBe(false);
     });
 
+    it('supports incremental adds for a growing archive', () => {
+        const matcher = createRoleNameMatcher(['碧蓝航线·南达科他'], ['碧蓝航线']);
+        matcher.add('约克城');
+        expect(matcher.has('约克城')).toBe(true);
+        // 增量加入后仍遵守「作品名可选」
+        expect(matcher.has('碧蓝航线·约克城')).toBe(true);
+        expect(matcher.has('安比')).toBe(false);
+    });
+
+    it('keeps suffix matching after incremental adds', () => {
+        const matcher = createRoleNameMatcher([], []);
+        matcher.add('碧蓝航线约克城II');
+        expect(matcher.has('约克城II')).toBe(true);
+    });
+
     it('ignores empty input', () => {
         const matcher = createRoleNameMatcher(['琴', '', null]);
         expect(matcher.has('')).toBe(false);
