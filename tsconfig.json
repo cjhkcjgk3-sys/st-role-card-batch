@@ -10,10 +10,5 @@
     "skipLibCheck": true,
     "strict": true
   },
-  "files": [
-    "src/novel/recoveryStore.js",
-    "src/storage/writerLock.js",
-    "src/worldbook/entries/overrides.js",
-    "src/worldbook/processing/splitText.js"
-  ]
+  "files": ["src/novel/recoveryStore.js"]
 }

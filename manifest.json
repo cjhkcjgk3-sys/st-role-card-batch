@@ -6,12 +6,12 @@
   "js": "index.js",
   "css": "style.css",
   "author": "cjhkcjgk3-sys",
-  "version": "1.16.0",
-  "description": "自动续写小说及同楼层批量写卡，支持断点续传",
+  "version": "2.0.0",
+  "description": "角色卡批量生成：名单逐条写卡、名录去重、图片库匹配",
   "generate_interceptor": "NovelGen_isolateRoleResult",
   "hooks": {
-    "enable": "enableNovelExtension",
-    "disable": "disposeNovelExtension",
-    "delete": "disposeNovelExtension"
+    "enable": "enableRoleExtension",
+    "disable": "disposeRoleExtension",
+    "delete": "disposeRoleExtension"
   }
 }

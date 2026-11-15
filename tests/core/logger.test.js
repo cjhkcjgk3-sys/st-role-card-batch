@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { createErrorRecord } from '../../txtToWorldbook/core/logger.js';
+import { createErrorRecord } from '../../src/core/logger.js';
 
 it('exports only error context and source locations, never arbitrary request data', () => {
     const error = new Error('没有返回正文');

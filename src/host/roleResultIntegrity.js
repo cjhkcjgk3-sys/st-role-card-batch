@@ -1,4 +1,4 @@
-import { createFileUtils } from '../../txtToWorldbook/core/fileUtils.js';
+import { createFileUtils } from '../core/fileUtils.js';
 
 export const RESULT_HASH_KEY = 'nag_result_hash';
 export const hashRoleResult = createFileUtils({ fullContent: true }).calculateFileHash;

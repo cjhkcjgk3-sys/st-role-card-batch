@@ -1,5 +1,5 @@
-import { abortableDelay, throwIfAborted } from '../../txtToWorldbook/core/requestPolicy.js';
-import { newIdentity } from '../../txtToWorldbook/core/chunkIdentity.js';
+import { abortableDelay, throwIfAborted } from '../core/requestPolicy.js';
+import { newIdentity } from '../core/chunkIdentity.js';
 import {
     applyArchiveSkips,
     hydrateRoleBatch,
@@ -8,7 +8,6 @@ import {
     updateRoleNames,
     parseRoleNames,
 } from './roleBatchState.js';
-import { readRoleWorldbook } from './roleWorldbook.js';
 import { isRoleCardTruncated } from './tagFilters.js';
 
 export const ROLE_PLACEHOLDER = '[[角色名]]';
@@ -709,92 +708,6 @@ export function createRoleBatchRunner({
                 checkpoint();
             } catch (error) {
                 Object.assign(batch, previous);
-                throw error;
-            } finally {
-                preparing = false;
-            }
-        },
-        async importWorldbook(data, filename = '') {
-            if (active || preparing) throw new Error('请先停止任务，再导入世界书');
-            preparing = true;
-            const settings = getSettings();
-            let previous;
-            let committed = false;
-            try {
-                const imported = readRoleWorldbook(data);
-                restore();
-                previous = { batch: settings.roleBatch, names: settings.roleNames, total: settings.totalChapters };
-                const initial = host.snapshot();
-                if (initial.identity == null || initial.generating === true) throw new Error('请先等待酒馆生成结束');
-                if (recovery && typeof initial.identity !== 'string')
-                    throw new Error('无法可靠识别当前聊天，暂不能保存恢复进度');
-                if (state() && state().identity !== initial.identity)
-                    throw new Error('请返回原聊天后导入；新建任务请使用“从头生成”');
-                if (state()) assertNoPreview(state());
-                if (state()) await host.reconcileRoleBatch(state(), validationOptions());
-                const batch = state()
-                    ? structuredClone(state())
-                    : hydrateRoleBatch({
-                          id: newIdentity('role-batch'),
-                          identity: initial.identity,
-                          ...host.prepareRoleBatch(),
-                          names: [],
-                          items: [],
-                          index: 0,
-                          attempt: 0,
-                          pending: false,
-                      });
-                if (!batch.template.includes(ROLE_PLACEHOLDER))
-                    throw new Error(`最后一条用户消息需要包含 ${ROLE_PLACEHOLDER}`);
-                updateRoleNames(batch, [
-                    ...parseRoleNames(settings.roleNames),
-                    ...imported.roles.map((role) => role.name),
-                ]);
-                const roles = imported.roles.flatMap((role) => {
-                    const item = batch.items.find((item) => item.name === role.name);
-                    return roleComplete(item) ? [] : [{ ...role, item }];
-                });
-                batch.inputNames = batch.names.join('\n');
-                batch.inputLimit = batch.names.length;
-                await host.importRoleResults(batch, { ...imported, roles, filename }, () => {
-                    batch.index = nextRoleIndex(batch);
-                    settings.roleBatch = batch;
-                    settings.roleNames = batch.inputNames;
-                    settings.totalChapters = batch.names.length;
-                    roles.forEach((role) => onRoleComplete(role.item.name));
-                    checkpoint();
-                    committed = true;
-                });
-                return {
-                    added: roles.length,
-                    duplicates: imported.duplicates + imported.roles.length - roles.length,
-                    skipped: imported.skipped,
-                };
-            } catch (error) {
-                if (previous && !committed) {
-                    settings.roleBatch = previous.batch;
-                    settings.roleNames = previous.names;
-                    settings.totalChapters = previous.total;
-                }
-                onError(error, { phase: 'import-worldbook' });
-                throw error;
-            } finally {
-                preparing = false;
-                onChange();
-            }
-        },
-        async exportWorldbook() {
-            if (active || preparing) throw new Error('请先停止任务，再导出世界书');
-            preparing = true;
-            try {
-                restore();
-                const batch = state();
-                if (!batch) throw new Error('当前没有角色成果可导出');
-                await host.reconcileRoleBatch(batch, validationOptions());
-                checkpoint();
-                return host.exportRoleWorldbook(batch);
-            } catch (error) {
-                onError(error, { phase: 'export-worldbook' });
                 throw error;
             } finally {
                 preparing = false;

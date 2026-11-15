@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { diffLines, diffStats, renderDiffHtml } from '../../txtToWorldbook/core/diff.js';
+import { diffLines, diffStats, renderDiffHtml } from '../../src/core/diff.js';
 
 describe('diffLines', () => {
     it('完全相同文本返回全部 equal', () => {

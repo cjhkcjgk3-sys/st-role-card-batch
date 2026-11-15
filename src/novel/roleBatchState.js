@@ -1,4 +1,4 @@
-import { newIdentity } from '../../txtToWorldbook/core/chunkIdentity.js';
+import { newIdentity } from '../core/chunkIdentity.js';
 import { createRoleNameMatcher, parseWithWorkKeys, workKeysOf } from './roleName.js';
 
 export const roleComplete = (item) =>

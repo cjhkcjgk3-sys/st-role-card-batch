@@ -1,7 +1,7 @@
 import { createRoleSelectionUI } from '../host/roleSelection.js';
 import { buildRoleMergePlan, mergeRolePlan, renderRoleComparison, validateRoleMerge } from './roleComparison.js';
 import { createBufferedStream } from '../host/bufferedStream.js';
-import { createNovelRecoveryStore, createRoleBatchRecoveryStore } from './recoveryStore.js';
+import { createRoleBatchRecoveryStore } from './recoveryStore.js';
 import {
     countUnidentifiedRolePages,
     duplicateRoleNames,
@@ -12,11 +12,9 @@ import {
     roleComplete,
     updateRoleNames,
 } from './roleBatchState.js';
-import { createNovelRunner } from './generation.js';
 import { createRoleBatchRunner, parseRoleNames } from './roleBatch.js';
 import { createRoleNameMatcher } from './roleName.js';
-import { createListRenderer } from '../../txtToWorldbook/ui/renderer.js';
-import { createErrorRecord } from '../../txtToWorldbook/core/logger.js';
+import { createErrorRecord } from '../core/logger.js';
 import { parseTagInput, extractTagContents, removeTagContents, applyTagFilters } from './tagFilters.js';
 import {
     addNamesToRoster,
@@ -103,9 +101,8 @@ export function initNovelUI(host) {
     let resultIsolation = null;
     let roleSelection = null;
     let generationStats = { startTime: null, chaptersGenerated: 0, totalCharacters: 0, errors: [] };
-    let recordedStatErrors = 0;
     let roleSuccessNotices = [];
-    const pluginVersion = '1.16.0';
+    const pluginVersion = '2.0.0';
     function recordError(error, details = {}) {
         if (['ABORTED', 'USER_STOPPED'].includes(error?.code)) return;
         const entries = Array.isArray(settings.errorLog) ? settings.errorLog : [];
@@ -596,25 +593,6 @@ export function initNovelUI(host) {
         enabled: () => settings.isRunning && settings.bufferModelStream,
         onError: (error) => recordError(error, { phase: 'buffered-stream' }),
     });
-    const novelRunner = createNovelRunner({
-        recovery: createNovelRecoveryStore(() => localStorage),
-        getSettings: () => settings,
-        snapshot: host.snapshot,
-        send: host.send,
-        onChange: () => {
-            for (const entry of generationStats.errors.slice(recordedStatErrors))
-                recordError(new Error(entry.error), { phase: 'auto-novel', roleIndex: entry.chapter });
-            recordedStatErrors = generationStats.errors.length;
-            saveSettings();
-            updateUI();
-        },
-        notify: (type, message) => toastr[type](message),
-        exportNovel: (...args) => exportNovel(...args),
-        onStats: (stats) => {
-            generationStats = stats;
-            recordedStatErrors = 0;
-        },
-    });
     const roleRunner = createRoleBatchRunner({
         recovery: createRoleBatchRecoveryStore(() => localStorage),
         getSettings: () => settings,
@@ -671,8 +649,13 @@ export function initNovelUI(host) {
             toastr.warning(error.message);
         },
     });
-    const currentRunner = () => (settings.generationMode === 'role-batch' ? roleRunner : novelRunner);
-    const roleStatusRenderer = createListRenderer();
+    /** 名单行的状态图标：进行中 / 失败 / 已完成 / 排队。 */
+    function roleStatusIcon(item) {
+        if (item.processing) return '⏳';
+        if (item.failed) return '❌';
+        if (item.processed) return '✅';
+        return '⏳';
+    }
 
     async function startGeneration() {
         if (fileOperation) return;
@@ -685,12 +668,10 @@ export function initNovelUI(host) {
             toastr.warning(error.message);
             return;
         }
-        if (settings.generationMode === 'role-batch') {
-            const currentPrompt = $('#nag-set-prompt').val();
-            if (typeof currentPrompt === 'string') settings.roleNames = currentPrompt;
-            roleRunner.saveInput();
-        }
-        return currentRunner().start();
+        const currentPrompt = $('#nag-set-prompt').val();
+        if (typeof currentPrompt === 'string') settings.roleNames = currentPrompt;
+        roleRunner.saveInput();
+        return roleRunner.start();
     }
     async function rerollCurrentRole() {
         if (settings.isRunning || fileOperation) return;
@@ -722,16 +703,16 @@ export function initNovelUI(host) {
         }
     }
     function pauseGeneration() {
-        currentRunner().pause();
-        toastr.info('当前章节结束后暂停');
+        roleRunner.pause();
+        toastr.info('当前角色结束后暂停');
     }
     function resumeGeneration() {
-        currentRunner().resume();
+        roleRunner.resume();
         toastr.info('已恢复');
     }
     function stopGeneration() {
-        currentRunner().stop();
-        toastr.warning('已停止自动续写；酒馆正在生成的回复可能仍会完成');
+        roleRunner.stop();
+        toastr.warning('已停止；酒馆正在生成的回复可能仍会完成');
     }
 
     async function resetProgress({ restart = false } = {}) {
@@ -752,17 +733,12 @@ export function initNovelUI(host) {
             } finally {
                 updateUI();
             }
-        } else currentRunner().resetPending();
-        if (settings.generationMode !== 'role-batch') settings.currentChapter = 0;
+        }
         generationStats = { startTime: null, chaptersGenerated: 0, totalCharacters: 0, errors: [] };
         saveSettings();
         updateUI();
         toastr.info(
-            settings.generationMode === 'role-batch'
-                ? restart
-                    ? '已清除完成进度，点击开始从头生成；已有回复保留'
-                    : '已重置运行状态，完成记录已保留；点击开始继续'
-                : '已重置',
+            restart ? '已清除完成进度，点击开始从头生成；已有回复保留' : '已重置运行状态，完成记录已保留；点击开始继续',
         );
     }
 
@@ -811,26 +787,6 @@ export function initNovelUI(host) {
 
     async function exportAsJSON(silent = false) {
         if (!(await verifyExportResults())) return;
-        if (settings.generationMode === 'role-batch') {
-            if (fileOperation) return;
-            fileOperation = true;
-            updateUI();
-            try {
-                const worldbook = await roleRunner.exportWorldbook();
-                downloadFile(
-                    JSON.stringify(worldbook, null, 2),
-                    `role-worldbook_${Date.now()}.json`,
-                    'application/json',
-                );
-                if (!silent) toastr.success('已导出角色世界书');
-            } catch (error) {
-                toastr.warning(error.message);
-            } finally {
-                fileOperation = false;
-                updateUI();
-            }
-            return;
-        }
         const chapters = getAllChapters();
         if (!chapters.length) {
             if (!silent) toastr.warning('没有内容');
@@ -842,32 +798,6 @@ export function initNovelUI(host) {
             'application/json',
         );
         if (!silent) toastr.success('已导出 JSON');
-    }
-
-    async function importWorldbookFile(file) {
-        if (!file || settings.isRunning || fileOperation) return;
-        fileOperation = true;
-        updateUI();
-        try {
-            let data;
-            try {
-                data = JSON.parse((await file.text()).replace(/^\uFEFF/, ''));
-            } catch {
-                throw new Error('世界书 JSON 格式无效，请检查文件');
-            }
-            const result = await roleRunner.importWorldbook(data, file.name);
-            toastr.success(
-                `已导入 ${result.added} 位角色，跳过 ${result.duplicates} 个重名项${result.skipped ? `、${result.skipped} 个无效条目` : ''}`,
-            );
-        } catch (error) {
-            // Parser messages may contain source text; only retain this bounded user-facing error.
-            if (error.message === '世界书 JSON 格式无效，请检查文件') recordError(error, { phase: 'import-worldbook' });
-            toastr.warning(error.message);
-        } finally {
-            fileOperation = false;
-            $('#nag-role-worldbook-file').val('');
-            syncUI();
-        }
     }
 
     async function importRoleImageFile(file) {
@@ -1399,12 +1329,9 @@ export function initNovelUI(host) {
         $('#nag-panel-archive').toggle(batchMode);
         $('#nag-role-correction-toggle').text(roleCorrection ? '完成纠错' : '手动纠错');
         $('#nag-role-correction-hint').toggle(batchMode && roleCorrection && !!batch);
-        $('#nag-btn-import-worldbook, #nag-btn-export-json').prop('disabled', busy);
-        $('#nag-btn-export-json').text(batchMode ? '📦 世界书 JSON' : '📦 JSON');
-        $('#nag-btn-export-json').attr(
-            'title',
-            batchMode ? '合并导出已有与新增角色；楼层范围仅用于 TXT 导出' : '导出所选楼层的 JSON',
-        );
+        $('#nag-btn-export-json').prop('disabled', busy);
+        $('#nag-btn-export-json').text('📦 JSON');
+        $('#nag-btn-export-json').attr('title', '按下方楼层范围与标签设置导出 JSON');
         $('#nag-set-autosave, #nag-set-retries').prop('disabled', batchMode);
         $('#nag-set-minlen, #nag-set-isolate-result, #nag-set-reroll-confirm, #nag-set-buffer-stream').prop(
             'disabled',
@@ -1440,7 +1367,7 @@ export function initNovelUI(host) {
                           : '';
                   return {
                       key: `${index}:${name}`,
-                      main: `${roleStatusRenderer.getStatusIcon(statusItem)} ${index + 1}. ${escapeHtml(name)}${suffix}${manual}${archivedMark}${failureMark}`,
+                      main: `${roleStatusIcon(statusItem)} ${index + 1}. ${escapeHtml(name)}${suffix}${manual}${archivedMark}${failureMark}`,
                       controls,
                       slot: roleImageSlot(name, index, imageLibrary),
                   };
@@ -1664,7 +1591,6 @@ export function initNovelUI(host) {
                         </div>
                         <div class="nag-btn-row">
                             <!-- 导入世界书已停用：改用独立的世界书合并插件 -->
-                            <input id="nag-role-worldbook-file" type="file" accept=".json,application/json" hidden>
                             <button id="nag-btn-export-txt" class="menu_button">📄 TXT</button>
                             <button id="nag-btn-export-json" class="menu_button">📦 JSON</button>
                         </div>
@@ -2018,12 +1944,6 @@ export function initNovelUI(host) {
         });
         $('#nag-btn-export-txt').on('click', () => exportNovel(false));
         $('#nag-btn-export-json').on('click', () => exportAsJSON(false));
-        $('#nag-btn-import-worldbook').on('click', () => {
-            if (!settings.isRunning && !fileOperation) $('#nag-role-worldbook-file').trigger('click');
-        });
-        $('#nag-role-worldbook-file').on('change', function () {
-            void importWorldbookFile(this.files?.[0]);
-        });
         $('#nag-btn-role-image-import').on('click', () => {
             if (!settings.isRunning && !fileOperation) $('#nag-role-image-file').trigger('click');
         });
@@ -2076,13 +1996,6 @@ export function initNovelUI(host) {
         $('#nag-btn-refresh-floors').on('click', () => $('#nag-total-floors').text(getTotalFloors()));
         $('#nag-btn-refresh-preview').on('click', refreshPreview);
         // TXT转世界书入口
-        $('#nag-btn-txt-to-worldbook').on('click', () => {
-            if (typeof window.TxtToWorldbook !== 'undefined') {
-                window.TxtToWorldbook.open();
-            } else {
-                toastr.error('TXT转世界书模块未加载');
-            }
-        });
 
         // 面板折叠 - 排除帮助按钮
         $('.nag-panel-header').on('click', function (e) {
@@ -2237,7 +2150,7 @@ export function initNovelUI(host) {
                 settings.totalChapters = settings.roleBatch.inputLimit;
                 $('#nag-set-total').val(settings.totalChapters);
             }
-            $('#nag-set-prompt').val(settings.generationMode === 'role-batch' ? settings.roleNames : settings.prompt);
+            $('#nag-set-prompt').val(settings.roleNames);
             saveSettings();
             updateUI();
         });
@@ -2495,11 +2408,9 @@ export function initNovelUI(host) {
 
     instance = {
         stop: () => {
-            novelRunner.stop();
             roleRunner.stop();
         },
         dispose() {
-            novelRunner.stop();
             roleRunner.stop();
             clearInterval(refreshTimer);
             disposed = true;

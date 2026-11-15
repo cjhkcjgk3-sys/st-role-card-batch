@@ -1,1 +1,1 @@
-export { enableNovelExtension, disposeNovelExtension } from './src/bootstrap.js';
+export { enableRoleExtension, disposeRoleExtension } from './src/bootstrap.js';

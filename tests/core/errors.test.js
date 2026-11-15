@@ -7,7 +7,7 @@ import {
     TokenLimitError,
     isRetryable,
     isUserFacing,
-} from '../../txtToWorldbook/core/errors.js';
+} from '../../src/core/errors.js';
 
 // ============================================================
 // 错误类型构造

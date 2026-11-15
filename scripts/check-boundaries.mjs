@@ -14,11 +14,7 @@ function files(dir) {
                   : [],
         );
 }
-const all = [
-    path.join(root, 'index.js'),
-    ...files(path.join(root, 'src')),
-    ...files(path.join(root, 'txtToWorldbook')),
-];
+const all = [path.join(root, 'index.js'), ...files(path.join(root, 'src'))];
 const graph = new Map();
 for (const file of all) {
     const relative = path.relative(root, file).replaceAll('\\', '/');
@@ -48,12 +44,6 @@ for (const file of all) {
                 imports.push(target);
             }
         }
-        if (
-            /^src\/worldbook\/(commands|entries|processing|formats)\//.test(relative) &&
-            ts.isIdentifier(node) &&
-            ['document', 'window', 'jQuery', 'ModalFactory'].includes(node.text)
-        )
-            throw new Error(`${relative}: UI dependency ${node.text}`);
         ts.forEachChild(node, visit);
     }
     visit(source);
@@ -70,6 +60,4 @@ function walk(file, chain = []) {
     visited.add(file);
 }
 for (const file of all) walk(file);
-console.log(
-    `Checked ${all.length} runtime modules: imports, host isolation, DOM-free worldbook commands and cycles passed.`,
-);
+console.log(`Checked ${all.length} runtime modules: imports, host isolation and cycles passed.`);

@@ -306,12 +306,12 @@ export async function runRoleIsolationChecks({ page, requests, reopenChat, conne
         const entry = await import('/scripts/extensions/third-party/Novel-Auto-Generator/index.js');
         const count = () => c.eventSource.events[c.eventTypes.MESSAGE_SWIPED].length;
         const before = count();
-        entry.disposeNovelExtension();
+        entry.disposeRoleExtension();
         const after = count();
         const cleared =
             !document.querySelector('.nag-result-plain, .nag-result-render-blocker') &&
             typeof window.NovelGen_isolateRoleResult === 'undefined';
-        entry.enableNovelExtension();
+        entry.enableRoleExtension();
         return { before, after, cleared, enabledAgain: count() };
     });
     assert.equal(cleanup.after, cleanup.before - 1);

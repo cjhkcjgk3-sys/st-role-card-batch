@@ -1272,3 +1272,26 @@
     color: #e74c3c;
     cursor: pointer;
 }
+
+/* 角色名单列表的容器与行（原先借自 txtToWorldbook 的样式，独立后收回到这里） */
+.ttw-memory-queue {
+    max-height: 200px;
+    overflow-y: auto;
+}
+
+.ttw-memory-item {
+    padding: 8px 12px;
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 4px;
+    margin-bottom: 6px;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.ttw-memory-item:hover {
+    background: rgba(0, 0, 0, 0.4);
+}

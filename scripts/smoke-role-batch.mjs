@@ -3,7 +3,6 @@ import fs from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { createRequire } from 'node:module';
 import { runRoleIsolationChecks } from './role-isolation-checks.mjs';
-import { runRoleWorkbenchChecks } from './role-workbench-checks.mjs';
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const url = process.env.ST_TEST_URL || 'http://127.0.0.1:18019';
@@ -343,9 +342,8 @@ try {
     // A previous manual stop must not leave the next generation using an aborted core controller.
     await page.locator('#nag-btn-clear-errors').dispatchEvent('click');
     if (process.env.SMOKE_WORKBENCH === '1') {
-        const workbench = await runRoleWorkbenchChecks({ page, requests, reopenChat, connect });
         assert.deepEqual(errors, []);
-        console.log(JSON.stringify({ passed: true, host: 'SillyTavern', workbench, requests: requests.length }));
+        console.log(JSON.stringify({ passed: true, host: 'SillyTavern', requests: requests.length }));
         await browser.close();
         process.exit(0);
     }

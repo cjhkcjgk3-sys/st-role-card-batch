@@ -1,4 +1,4 @@
-import { diffLines, diffStats } from '../../txtToWorldbook/core/diff.js';
+import { diffLines, diffStats } from '../core/diff.js';
 
 const MAX_CELLS = 200000;
 const MAX_TEXT = 200000;

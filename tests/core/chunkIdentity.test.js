@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { ensureChunkIdentities, assignSplitIdentities } from '../../txtToWorldbook/core/chunkIdentity.js';
+import { ensureChunkIdentities, assignSplitIdentities } from '../../src/core/chunkIdentity.js';
 it('preserves serialized identity and gives split children distinct identities with source ranges', () => {
     const parent = { content: 'abcdef' };
     ensureChunkIdentities([parent]);
