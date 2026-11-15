@@ -438,6 +438,8 @@ export function createRoleBatchRunner({
                 legacy: false,
                 swipe: captured.index,
             });
+            // 单角色重生成也要收录：从失败状态重生成成功的角色否则不会进入名录
+            onRoleComplete(captured.name);
             batch.pending = false;
             batch.dispatch = null;
             checkpoint();
@@ -644,6 +646,8 @@ export function createRoleBatchRunner({
                     legacy: false,
                     swipe: preview.index,
                 });
+                // 用候选版本替换成功，同样要收录进名录
+                onRoleComplete(preview.name);
             }
             checkpoint();
             if (!item) notify('warning', '已替换，但角色记录已变化，请核对名单状态');

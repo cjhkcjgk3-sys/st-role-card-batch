@@ -38,7 +38,8 @@ function fixture(result = { text: '新角色正文', swipe: 3 }) {
         restoreRoleTemplateIfEquals: vi.fn(async () => true),
     };
     const notify = vi.fn(),
-        onError = vi.fn();
+        onError = vi.fn(),
+        onRoleComplete = vi.fn();
     const runner = createRoleBatchRunner({
         getSettings: () => settings,
         host,
@@ -46,8 +47,9 @@ function fixture(result = { text: '新角色正文', swipe: 3 }) {
         notify,
         onStats: vi.fn(),
         onError,
+        onRoleComplete,
     });
-    return { batch, settings, host, notify, onError, runner };
+    return { batch, settings, host, notify, onError, onRoleComplete, runner };
 }
 
 it('regenerates only the selected role using its own name and retains the other bindings', async () => {
@@ -103,4 +105,10 @@ it('reports a refresh failure accurately after saving rather than claiming the o
     await runner.rerollSelected();
     expect(host.restoreRoleRerollView).not.toHaveBeenCalled();
     expect(notify).toHaveBeenCalledWith('warning', expect.stringContaining('已保存'));
+});
+
+it('records a freshly rerolled role in the archive', async () => {
+    const { runner, onRoleComplete } = fixture();
+    await runner.rerollSelected();
+    expect(onRoleComplete).toHaveBeenCalledWith('乙');
 });

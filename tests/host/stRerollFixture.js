@@ -289,7 +289,8 @@ export function fixture({
             ...overrides,
         };
         const notify = vi.fn(),
-            onError = vi.fn();
+            onError = vi.fn(),
+            onRoleComplete = vi.fn();
         const recovery = storage ? createRoleBatchRecoveryStore(() => storage) : undefined;
         const runner = createRoleBatchRunner({
             getSettings: () => settings,
@@ -298,9 +299,10 @@ export function fixture({
             notify,
             onStats: () => {},
             onError,
+            onRoleComplete,
             recovery,
         });
-        return { runner, settings, notify, onError };
+        return { runner, settings, notify, onError, onRoleComplete };
     }
     /** Simulate a page reload: a fresh host, and a batch read back only from the persisted journal. */
     function reload(storage, overrides = {}) {

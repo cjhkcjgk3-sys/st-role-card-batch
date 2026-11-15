@@ -228,3 +228,11 @@ it('with result isolation on, an accepted candidate is re-sealed and still valid
     await f.getHost().reconcileRoleBatch(f.batch, { minLength: 100 });
     expect(f.batch.items[1]).toMatchObject({ swipe: 1, processed: true, failed: false });
 });
+
+it('records the accepted preview in the archive', async () => {
+    const { f, r } = setup();
+    await r.runner.rerollSelected();
+    await r.runner.acceptPreview();
+    expect(r.onRoleComplete).toHaveBeenCalledWith('乙');
+    expect(f.batch.items[1]).toMatchObject({ processed: true, failed: false, swipe: 1 });
+});
