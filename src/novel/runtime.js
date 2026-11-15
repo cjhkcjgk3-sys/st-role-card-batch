@@ -105,7 +105,7 @@ export function initNovelUI(host) {
     let generationStats = { startTime: null, chaptersGenerated: 0, totalCharacters: 0, errors: [] };
     let recordedStatErrors = 0;
     let roleSuccessNotices = [];
-    const pluginVersion = '1.15.16';
+    const pluginVersion = '1.16.0';
     function recordError(error, details = {}) {
         if (['ABORTED', 'USER_STOPPED'].includes(error?.code)) return;
         const entries = Array.isArray(settings.errorLog) ? settings.errorLog : [];
@@ -1196,6 +1196,8 @@ export function initNovelUI(host) {
 
     function loadSettings() {
         settings = Object.assign({}, defaultSettings, host.readSettings(extensionName));
+        // 本插件只做角色卡批量生成：忽略历史设置里的小说模式
+        settings.generationMode = 'role-batch';
         const savedSettings = host.readSettings(extensionName);
         if (!Object.hasOwn(savedSettings, 'isolateRoleResult'))
             settings.isolateRoleResult = !!savedSettings.hideHistoryFromModel;
@@ -1339,7 +1341,7 @@ export function initNovelUI(host) {
         $('#nag-set-mode, #nag-set-prompt, #nag-set-total').prop('disabled', busy);
         $('#nag-set-total').prop('readOnly', batchMode);
         if (batchMode) $('#nag-set-total').val(roleNames.length);
-        $('#nag-role-name-hint, #nag-btn-import-worldbook').toggle(batchMode);
+        $('#nag-role-name-hint').toggle(batchMode);
         const imageLibrary = settings.roleImageLibrary;
         const imageCount = Array.isArray(imageLibrary?.items) ? imageLibrary.items.length : 0;
         $('#nag-role-image-library-controls').toggle(batchMode);
@@ -1565,7 +1567,8 @@ export function initNovelUI(host) {
                         </div>
                     </div>
                     <div class="nag-panel-content">
-                        <div class="nag-setting-item"><label>生成方式</label><select id="nag-set-mode"><option value="novel">原有自动续写</option><option value="role-batch">同楼层批量生成</option></select></div>
+                        <!-- 本插件只做角色卡批量生成，不再提供小说模式切换 -->
+                        <div class="nag-setting-item" style="display:none"><label>生成方式</label><select id="nag-set-mode"><option value="novel">原有自动续写</option><option value="role-batch">同楼层批量生成</option></select></div>
                         <div class="nag-setting-item"><label id="nag-total-label">目标章节</label><input type="number" id="nag-set-total" min="1"></div>
                         <div class="nag-setting-item"><label id="nag-prompt-label">提示词</label><textarea id="nag-set-prompt" rows="4"></textarea></div>
                         <small id="nag-role-name-hint" class="nag-hint" style="display:none">每行一个完整角色名。同名只处理一次，已有成功结果自动跳过。修改写卡提示词：先停止任务，在聊天中编辑并保存原提示词楼层，保留 [[角色名]]；继续或重生成时自动使用新提示词。</small>
@@ -1660,7 +1663,7 @@ export function initNovelUI(host) {
                             <label class="nag-checkbox-label"><input type="checkbox" id="nag-set-use-raw"><span>📄 原始 (chat.mes)</span></label>
                         </div>
                         <div class="nag-btn-row">
-                            <button id="nag-btn-import-worldbook" class="menu_button" style="display:none">📥 导入世界书</button>
+                            <!-- 导入世界书已停用：改用独立的世界书合并插件 -->
                             <input id="nag-role-worldbook-file" type="file" accept=".json,application/json" hidden>
                             <button id="nag-btn-export-txt" class="menu_button">📄 TXT</button>
                             <button id="nag-btn-export-json" class="menu_button">📦 JSON</button>
@@ -1802,7 +1805,8 @@ export function initNovelUI(host) {
                             </div>
                             <div class="nag-module-body">
                                 <div class="nag-module-desc">控制自动生成的行为参数</div>
-                                <div class="nag-setting-row">
+                                <!-- 小说模式专用，已隐藏 -->
+                                <div class="nag-setting-row" style="display:none">
                                     <div class="nag-setting-item">
                                         <label>自动保存间隔</label>
                                         <input type="number" id="nag-set-autosave" min="1">
@@ -1823,14 +1827,7 @@ export function initNovelUI(host) {
                     </div>
                 </div>
 
-                <!-- 📚 TXT转世界书模块 -->
-                <div class="nag-section">
-                    <div class="nag-btn-row">
-                        <button id="nag-btn-txt-to-worldbook" class="menu_button" style="background: linear-gradient(135deg, #e67e22, #d35400);">
-                            📚 TXT转世界书
-                        </button>
-                    </div>
-                </div>
+                <!-- 📚 TXT转世界书入口已停用 -->
 
             </div>
         </div>

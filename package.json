@@ -1,9 +1,9 @@
 {
-  "name": "novel-auto-generator",
-  "version": "1.15.16",
+  "name": "st-role-card-batch",
+  "version": "1.16.0",
   "private": true,
   "type": "module",
-  "description": "SillyTavern 扩展插件 — AI 自动续写小说 + TXT 转世界书",
+  "description": "SillyTavern 扩展 — 角色卡批量生成",
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
