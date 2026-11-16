@@ -108,7 +108,7 @@ export function initNovelUI(host) {
     let archiveMatcherCache = null;
     let renderedArchiveKey = null;
     let progressCountCache = null;
-    const pluginVersion = '2.0.0';
+    const pluginVersion = '2.0.1';
     function invalidateRoleArchive() {
         archiveRevision++;
         archiveMatcherCache = null;
@@ -919,22 +919,15 @@ export function initNovelUI(host) {
         const view = listChecklistRoles(library, settings.roleNames, query);
         const roster = new Set(parseRoleNames(settings.roleNames));
         for (const name of [...checklistSelection]) if (roster.has(name)) checklistSelection.delete(name);
-        const all = [...view.roles, ...view.skins];
-        const inRoster = library.checklist.roles.concat(library.checklist.skins).filter((name) => roster.has(name));
+        const all = view.roles;
+        const inRoster = library.checklist.roles.filter((name) => roster.has(name));
         $('#nag-role-checklist-summary').text(
-            `「${library.workName}」清单 ${view.total} 个名字，已在名单 ${inRoster.length} 个${query.trim() ? `；搜索到 ${all.length} 个` : ''}`,
+            `「${library.workName}」角色清单 ${library.checklist.roles.length} 个名字，已在名单 ${inRoster.length} 个${query.trim() ? `；搜索到 ${all.length} 个` : ''}`,
         );
         $('#nag-role-checklist-roles').html(
             view.roles.length
                 ? checklistRowsHtml(view.roles)
                 : `<small class="nag-hint">${query.trim() ? '没有搜索到角色' : '清单里没有角色'}</small>`,
-        );
-        $('#nag-role-checklist-skins-wrap').toggle(library.checklist.skins.length > 0);
-        $('#nag-role-checklist-skins-count').text(
-            query.trim() ? `${view.skins.length}/${library.checklist.skins.length}` : library.checklist.skins.length,
-        );
-        $('#nag-role-checklist-skins').html(
-            view.skins.length ? checklistRowsHtml(view.skins) : '<small class="nag-hint">没有搜索到皮肤</small>',
         );
         updateChecklistCount();
     }
@@ -956,7 +949,7 @@ export function initNovelUI(host) {
         if (settings.generationMode !== 'role-batch') return;
         const library = settings.roleImageLibrary;
         if (!hasChecklistRoles(library)) return;
-        const order = [...library.checklist.roles, ...library.checklist.skins];
+        const order = library.checklist.roles;
         const names = order.filter((name) => checklistSelection.has(name));
         if (!names.length) return toastr.info('请先勾选要加入的角色');
         const result = addNamesToRoster(settings.roleNames, names);
@@ -1579,15 +1572,7 @@ export function initNovelUI(host) {
                                     <button type="button" id="nag-btn-role-checklist-add" class="menu_button" disabled>➕ 加入名单（0）</button>
                                 </div>
                                 <div id="nag-role-checklist-roles" class="nag-role-checklist-list"></div>
-                                <details id="nag-role-checklist-skins-wrap" class="nag-role-checklist-skins" style="display:none">
-                                    <summary>皮肤（<span id="nag-role-checklist-skins-count">0</span>）</summary>
-                                    <div class="nag-btn-row nag-role-checklist-actions">
-                                        <button type="button" class="menu_button nag-role-checklist-all" data-target="#nag-role-checklist-skins">全选皮肤</button>
-                                        <button type="button" class="menu_button nag-role-checklist-none" data-target="#nag-role-checklist-skins">全不选皮肤</button>
-                                    </div>
-                                    <div id="nag-role-checklist-skins" class="nag-role-checklist-list"></div>
-                                </details>
-                                <small class="nag-hint">名字和清单完全一致，加入后与图片同名；已在名单里的灰色不可选。全选只选当前搜索结果。</small>
+                                <small class="nag-hint">名字和清单完全一致，加入后与图片同名；只展示角色清单，皮肤不加入名单。已在名单里的灰色不可选。全选只选当前搜索结果。</small>
                             </div>
                             <small class="nag-hint">名单里角色名右边有缩略图＝有图，点缩略图看原图；空框＝无图，照常按文字生成。匹配顺序：先完整名称，再去掉作品名后按「角色名+备注」（如 安比（绝区零）改 → 安比（改））；写了备注但没有对应形态图时不使用本体图，不做模糊匹配。</small>
                         </div>

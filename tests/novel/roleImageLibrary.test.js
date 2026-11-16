@@ -426,12 +426,14 @@ describe('importRoleImageZip', () => {
         ).rejects.toThrow('只能包含一个作品');
         await expect(
             importRoleImageZip(zipFile([{ name: 'a.png', data: PNG }]), createHost(), options),
-        ).rejects.toThrow('00-清单.md');
+        ).rejects.toThrow('00-角色清单.md 或 00-清单.md');
         const huge = { name: 'big.zip', size: 1024 * 1024 * 1024 + 1 };
         await expect(importRoleImageZip(huge, createHost(), options)).rejects.toThrow('1 GB');
         const big = { name: 'big.zip', size: 900 * 1024 * 1024 };
         const open = async () => ({ entries: [], readEntry: async () => new Blob() });
-        await expect(importRoleImageZip(big, createHost(), { ...options, open })).rejects.toThrow('00-清单.md');
+        await expect(importRoleImageZip(big, createHost(), { ...options, open })).rejects.toThrow(
+            '00-角色清单.md 或 00-清单.md',
+        );
     });
 
     it('ignores macOS metadata entries and skips unreadable images', async () => {
@@ -490,6 +492,94 @@ describe('importRoleImageZip', () => {
         const cleared = await clearRoleImageLibrary(result.library, ok);
         expect(cleared).toMatchObject({ library: null, deleted: 4, failed: 0 });
         expect(ok.deletes).toHaveLength(8);
+    });
+});
+
+describe('separate role and skin manifests', () => {
+    const roles = '# 示例角色图片清单\n\n- [ ] 安比\n- [ ] 妮可';
+    const skins = '# 示例皮肤清单\n\n## 安比\n- [x] [安比（泳装）](<安比（泳装）.png>)\n## 妮可\n- [ ] 妮可（节日）';
+    const files = [
+        { name: '示例/00-角色清单.md', data: roles },
+        { name: '示例/01-皮肤清单.md', data: skins },
+        { name: '示例/安比（泳装）.png', data: PNG },
+        { name: '示例/00-清单.md', data: '# 旧角色图片清单\n\n- [ ] 不应读取' },
+    ];
+
+    it('prefers the new pair, preserves skin images and never substitutes them for a missing base', async () => {
+        const result = await importRoleImageZip(zipFile(files), createHost(), { makeThumbnail: fakeThumbnail });
+        expect(result.library.checklist).toEqual({ roles: ['安比', '妮可'], skins: ['安比（泳装）', '妮可（节日）'] });
+        expect(matchRoleImage('安比', result.library).item).toBeNull();
+        expect(matchRoleImage('安比（泳装）', result.library).item?.name).toBe('安比（泳装）');
+        expect(result.imported).toBe(1);
+    });
+
+    it('does not match a skin whose alias collides with a missing base role', () => {
+        const lib = {
+            workNames: ['示例'],
+            checklist: { roles: ['安比'], skins: ['安比（泳装）'] },
+            items: [{ name: '安比（泳装）', aliases: ['安比'], fileName: '安比（泳装）', path: 'skin.webp' }],
+        };
+        expect(matchRoleImage('安比', lib).item).toBeNull();
+        expect(matchRoleImage('安比（泳装）', lib).item?.name).toBe('安比（泳装）');
+    });
+
+    it('imports a new roles-only manifest', async () => {
+        const result = await importRoleImageZip(
+            zipFile([
+                { name: '00-角色清单.md', data: '# 示例角色图片清单\n- [x] [安比](<安比.png>)' },
+                { name: '安比.png', data: PNG },
+            ]),
+            createHost(),
+            { makeThumbnail: fakeThumbnail },
+        );
+        expect(result.library.checklist).toEqual({ roles: ['安比'], skins: [] });
+    });
+
+    it('still imports a legacy 00-清单.md ZIP with a 皮肤 section', async () => {
+        const manifest = `# 绝区零角色图片清单\n\n- [x] [安比](<安比.png>)\n\n## 皮肤\n\n- [x] [安比（泳装）](<安比（泳装）.png>)\n`;
+        const result = await importRoleImageZip(
+            zipFile([
+                { name: '绝区零/00-清单.md', data: manifest },
+                { name: '绝区零/安比.png', data: PNG },
+                { name: '绝区零/安比（泳装）.png', data: PNG },
+            ]),
+            createHost(),
+            { makeThumbnail: fakeThumbnail },
+        );
+        expect(result.library.checklist).toEqual({ roles: ['安比'], skins: ['安比（泳装）'] });
+        expect(result.imported).toBe(2);
+        expect(matchRoleImage('安比', result.library).item?.name).toBe('安比');
+        expect(matchRoleImage('安比（泳装）', result.library).item?.name).toBe('安比（泳装）');
+    });
+
+    it('rejects a ZIP with several role manifests or manifests in different folders', async () => {
+        await expect(
+            importRoleImageZip(
+                zipFile([
+                    { name: '甲/00-角色清单.md', data: '# 甲角色图片清单\n- [ ] 安比' },
+                    { name: '乙/00-角色清单.md', data: '# 乙角色图片清单\n- [ ] 妮可' },
+                ]),
+                createHost(),
+                { makeThumbnail: fakeThumbnail },
+            ),
+        ).rejects.toThrow('发现多个角色清单');
+        await expect(
+            importRoleImageZip(
+                zipFile([
+                    { name: '甲/00-角色清单.md', data: '# 甲角色图片清单\n- [ ] 安比' },
+                    { name: '乙/00-清单.md', data: '# 乙角色图片清单\n- [ ] 妮可' },
+                ]),
+                createHost(),
+                { makeThumbnail: fakeThumbnail },
+            ),
+        ).rejects.toThrow('发现多个目录的清单');
+        await expect(
+            importRoleImageZip(
+                zipFile([{ name: '示例/01-皮肤清单.md', data: '# 示例皮肤清单\n- [ ] 安比（泳装）' }]),
+                createHost(),
+                { makeThumbnail: fakeThumbnail },
+            ),
+        ).rejects.toThrow('00-角色清单.md 或 00-清单.md');
     });
 });
 
