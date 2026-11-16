@@ -414,18 +414,30 @@ it('retries the same name twice and advances after the third attempt succeeds', 
     expect(settings.roleBatch.index).toBe(2);
 });
 
-it('marks failure and stops the batch after exactly three empty replies', async () => {
+it('skips a role after three empty replies, continues, and retries it on the next run', async () => {
     vi.useFakeTimers();
-    const { settings, host, runner } = setup([{ text: '  ' }]);
+    const { settings, host, runner, notify } = setup([
+        { text: '  ' },
+        { text: '  ' },
+        { text: '  ' },
+        { text: '完成' },
+    ]);
+    settings.roleNames = '琴\n安柏';
     const task = runner.start();
     await vi.runAllTimersAsync();
     await task;
-    expect(host.generateRoleReply).toHaveBeenCalledTimes(3);
-    expect(settings.roleBatch.index).toBe(0);
-    expect(settings.roleBatch.items[0]).toMatchObject({ name: '琴', failed: true });
-    expect(settings.roleBatch.items[1]?.processed).not.toBe(true);
+    expect(host.generateRoleReply).toHaveBeenCalledTimes(4);
+    expect(settings.roleBatch.items[0]).toMatchObject({ name: '琴', failed: true, error: '没有返回内容' });
+    expect(settings.roleBatch.items[1]).toMatchObject({ name: '安柏', processed: true, failed: false });
+    expect(notify).toHaveBeenCalledWith('warning', expect.stringContaining('仍有 1 项未完成'));
     expect(settings.isRunning).toBe(false);
     expect(host.restoreRoleTemplate).toHaveBeenCalledWith(settings.roleBatch);
+    const retry = runner.start();
+    await vi.runAllTimersAsync();
+    await retry;
+    expect(host.generateRoleReply).toHaveBeenCalledTimes(5);
+    expect(host.generateRoleReply.mock.calls[4][1]).toContain('琴');
+    expect(settings.roleBatch.items[0]).toMatchObject({ failed: false, error: null });
 });
 
 it('marks explicit truncation and continues without retrying that character', async () => {
@@ -440,15 +452,20 @@ it('marks explicit truncation and continues without retrying that character', as
     expect(settings.roleBatch.items.map((item) => item.failed)).toEqual([true, false]);
 });
 
-it('does not advance for a truncation signal with no returned text', async () => {
+it('retries an empty truncation signal three times before moving to the next role', async () => {
     vi.useFakeTimers();
-    const { settings, host, runner } = setup([{ text: '', truncated: true }]);
+    const { settings, host, runner } = setup([
+        { text: '', truncated: true },
+        { text: '', truncated: true },
+        { text: '', truncated: true },
+        { text: '完成' },
+    ]);
+    settings.roleNames = '琴\n安柏';
     const task = runner.start();
     await vi.runAllTimersAsync();
     await task;
-    expect(host.generateRoleReply).toHaveBeenCalledTimes(3);
-    expect(settings.roleBatch.index).toBe(0);
-    expect(settings.roleBatch.items[1]?.processed).not.toBe(true);
+    expect(host.generateRoleReply).toHaveBeenCalledTimes(4);
+    expect(settings.roleBatch.items.map((item) => item.failed)).toEqual([true, false]);
 });
 
 it('keeps uncertain requests pending and does not blindly resend on restart', async () => {

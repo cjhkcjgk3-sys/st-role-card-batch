@@ -278,6 +278,7 @@ export function createRoleBatchRunner({
                                     expectedClosingTags: settings.expectedClosingTags,
                                 }),
                             ),
+                            error: null,
                             swipe: reply.swipe,
                         };
                         if (!batch.items[batch.index].failed) onRoleComplete(batch.items[batch.index].name);
@@ -315,7 +316,14 @@ export function createRoleBatchRunner({
                                 failed: true,
                                 error: error.message,
                             };
-                            throw error;
+                            if (error.uncertain) throw error;
+                            stats.errors.push({ chapter: batch.index + 1, error: error.message });
+                            notify('warning', `${name}：尝试 3 次均失败，已跳过并继续生成下一个角色`);
+                            batch.index++;
+                            batch.dispatch = null;
+                            completed = true;
+                            checkpoint();
+                            break;
                         }
                         notify('warning', `${name}：${error.message}，即将进行第 ${attempt + 1}/3 次尝试`);
                         checkpoint();
