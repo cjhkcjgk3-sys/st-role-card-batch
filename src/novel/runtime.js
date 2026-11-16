@@ -30,6 +30,8 @@ import {
     setRoleImageDisabled,
 } from './roleImageLibrary.js';
 
+export const PLUGIN_DISPLAY_NAME = '角色卡批量生成器';
+
 let instance = null;
 export function initNovelUI(host) {
     if (instance) return instance;
@@ -108,7 +110,7 @@ export function initNovelUI(host) {
     let archiveMatcherCache = null;
     let renderedArchiveKey = null;
     let progressCountCache = null;
-    const pluginVersion = '2.0.1';
+    const pluginVersion = '2.0.2';
     function invalidateRoleArchive() {
         archiveRevision++;
         archiveMatcherCache = null;
@@ -1506,7 +1508,7 @@ export function initNovelUI(host) {
     <div id="nag-container">
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b>📚 小说自动生成器</b>
+                <b>${PLUGIN_DISPLAY_NAME}</b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">

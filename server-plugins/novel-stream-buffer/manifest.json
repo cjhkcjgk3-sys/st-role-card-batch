@@ -1,5 +1,5 @@
 {
-  "display_name": "小说生成流式暂存",
+  "display_name": "角色卡生成流式暂存",
   "version": "0.1.0",
-  "description": "为小说生成器在酒馆服务器上暂存单次流式输出。"
+  "description": "为角色卡批量生成器在酒馆服务器上暂存单次流式输出。"
 }
