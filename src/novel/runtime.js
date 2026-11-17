@@ -1434,7 +1434,7 @@ export function initNovelUI(host) {
             ? visibleIndices.slice(rowStart, rowStart + ROLE_ROWS_PAGE).map((index) => {
                   const name = roleNames[index];
                   const item = batch?.items[index] || {};
-                  const suffix = item.processing ? ` 第 ${batch.attempt}/3 次尝试` : '';
+                  const suffix = item.processing ? ' 生成中' : '';
                   const roleState = resolveRoleStatus(item, archiveNameMatcher.has(name));
                   const manual = roleState.manual ? '（手动）' : '';
                   const archivedMark = roleState.archived ? '（名录）' : '';

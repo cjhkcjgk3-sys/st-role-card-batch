@@ -239,98 +239,87 @@ export function createRoleBatchRunner({
                     continue;
                 }
                 const name = batch.names[batch.index];
-                let completed = false;
-                for (let attempt = 1; attempt <= 3; attempt++) {
+                const attempt = 1;
+                assertCurrent(run);
+                batch.attempt = attempt;
+                batch.items[batch.index] = { ...batch.items[batch.index], name, processing: true };
+                batch.pending = true;
+                batch.dispatch = { itemId: batch.items[batch.index].id, attemptId: newIdentity('attempt') };
+                checkpoint();
+                try {
+                    const reply = await host.generateRoleReply(
+                        batch,
+                        batch.template.replaceAll(ROLE_PLACEHOLDER, () => name),
+                        {
+                            signal: run.controller.signal,
+                            assertCurrent: () => assertCurrent(run),
+                            timeoutMs: settings.replyTimeoutMs || 600000,
+                            validationOptions: validationOptions(),
+                        },
+                    );
                     assertCurrent(run);
-                    batch.attempt = attempt;
-                    batch.items[batch.index] = { ...batch.items[batch.index], name, processing: true };
-                    batch.pending = true;
-                    batch.dispatch = { itemId: batch.items[batch.index].id, attemptId: newIdentity('attempt') };
-                    checkpoint();
-                    try {
-                        const reply = await host.generateRoleReply(
-                            batch,
-                            batch.template.replaceAll(ROLE_PLACEHOLDER, () => name),
-                            {
-                                signal: run.controller.signal,
-                                assertCurrent: () => assertCurrent(run),
-                                timeoutMs: settings.replyTimeoutMs || 600000,
-                                validationOptions: validationOptions(),
-                            },
-                        );
-                        assertCurrent(run);
-                        batch.pending = false;
-                        if (!reply.text?.trim()) throw reply.error || new Error('没有返回内容');
-                        batch.items[batch.index] = {
-                            ...batch.items[batch.index],
-                            name,
-                            legacy: false,
-                            processing: false,
-                            processed: true,
-                            manualStatus:
-                                reply.truncated || isRoleCardTruncated(reply.text, validationOptions())
-                                    ? batch.items[batch.index].manualStatus
-                                    : null,
-                            failed: Boolean(
-                                reply.truncated ||
-                                isRoleCardTruncated(reply.text, {
-                                    minLength: settings.minChapterLength,
-                                    expectedClosingTags: settings.expectedClosingTags,
-                                }),
-                            ),
-                            error: null,
-                            swipe: reply.swipe,
-                        };
-                        if (!batch.items[batch.index].failed) onRoleComplete(batch.items[batch.index].name);
-                        const truncated =
+                    batch.pending = false;
+                    if (!reply.text?.trim()) throw reply.error || new Error('没有返回内容');
+                    batch.items[batch.index] = {
+                        ...batch.items[batch.index],
+                        name,
+                        legacy: false,
+                        processing: false,
+                        processed: true,
+                        manualStatus:
+                            reply.truncated || isRoleCardTruncated(reply.text, validationOptions())
+                                ? batch.items[batch.index].manualStatus
+                                : null,
+                        failed: Boolean(
                             reply.truncated ||
                             isRoleCardTruncated(reply.text, {
                                 minLength: settings.minChapterLength,
                                 expectedClosingTags: settings.expectedClosingTags,
-                            });
-                        if (truncated) stats.errors.push({ chapter: batch.index + 1, error: '角色卡未闭合或内容截断' });
-                        batch.index++;
-                        batch.dispatch = null;
-                        stats.chaptersGenerated++;
-                        stats.totalCharacters += reply.text?.length || 0;
-                        completed = true;
-                        checkpoint();
-                        break;
-                    } catch (error) {
-                        assertCurrent(run);
-                        if (error.code === 'CHECKPOINT_FAILED') throw error;
-                        onError(error, {
-                            phase: error.phase || 'generate-reply',
-                            roleIndex: batch.index + 1,
-                            attempt,
-                            promptFloor: batch.promptFloor,
-                            resultFloor: batch.resultFloor,
-                            generating: host.snapshot().generating,
+                            }),
+                        ),
+                        error: null,
+                        swipe: reply.swipe,
+                    };
+                    if (!batch.items[batch.index].failed) onRoleComplete(batch.items[batch.index].name);
+                    const truncated =
+                        reply.truncated ||
+                        isRoleCardTruncated(reply.text, {
+                            minLength: settings.minChapterLength,
+                            expectedClosingTags: settings.expectedClosingTags,
                         });
-                        batch.pending = !!error.uncertain;
-                        if (error.uncertain || attempt === 3) {
-                            batch.items[batch.index] = {
-                                ...batch.items[batch.index],
-                                name,
-                                processed: true,
-                                failed: true,
-                                error: error.message,
-                            };
-                            if (error.uncertain) throw error;
-                            stats.errors.push({ chapter: batch.index + 1, error: error.message });
-                            notify('warning', `${name}：尝试 3 次均失败，已跳过并继续生成下一个角色`);
-                            batch.index++;
-                            batch.dispatch = null;
-                            completed = true;
-                            checkpoint();
-                            break;
-                        }
-                        notify('warning', `${name}：${error.message}，即将进行第 ${attempt + 1}/3 次尝试`);
-                        checkpoint();
-                        await abortableDelay(1000, run.controller.signal);
-                    }
+                    if (truncated) stats.errors.push({ chapter: batch.index + 1, error: '角色卡未闭合或内容截断' });
+                    batch.index++;
+                    batch.dispatch = null;
+                    stats.chaptersGenerated++;
+                    stats.totalCharacters += reply.text?.length || 0;
+                    checkpoint();
+                } catch (error) {
+                    assertCurrent(run);
+                    if (error.code === 'CHECKPOINT_FAILED') throw error;
+                    onError(error, {
+                        phase: error.phase || 'generate-reply',
+                        roleIndex: batch.index + 1,
+                        attempt,
+                        promptFloor: batch.promptFloor,
+                        resultFloor: batch.resultFloor,
+                        generating: host.snapshot().generating,
+                    });
+                    batch.pending = !!error.uncertain;
+                    batch.items[batch.index] = {
+                        ...batch.items[batch.index],
+                        name,
+                        processing: false,
+                        processed: true,
+                        failed: true,
+                        error: error.message,
+                    };
+                    if (error.uncertain) throw error;
+                    stats.errors.push({ chapter: batch.index + 1, error: error.message });
+                    notify('warning', `${name}：生成失败，已跳过并继续生成下一个角色`);
+                    batch.index++;
+                    batch.dispatch = null;
+                    checkpoint();
                 }
-                if (!completed) break;
                 await abortableDelay(Math.max(0, settings.replyWaitTime || 0), run.controller.signal);
             }
             const remaining = batch.items.filter((item) => !item.parked && !roleComplete(item)).length;

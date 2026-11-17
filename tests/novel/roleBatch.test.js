@@ -397,9 +397,9 @@ it('stops at the shorter list and accepts short or unformatted text', async () =
     expect(settings.roleBatch.index).toBe(1);
 });
 
-it('retries the same name twice and advances after the third attempt succeeds', async () => {
+it('skips an error immediately and advances to the next role', async () => {
     vi.useFakeTimers();
-    const { settings, host, runner } = setup([{ text: '' }, new Error('network'), { text: '正文' }]);
+    const { settings, host, runner } = setup([new Error('network'), { text: '正文' }]);
     settings.roleNames = '琴\n安柏';
     settings.totalChapters = 2;
     const task = runner.start();
@@ -407,11 +407,10 @@ it('retries the same name twice and advances after the third attempt succeeds', 
     await task;
     expect(host.generateRoleReply.mock.calls.map((call) => call[1])).toEqual([
         '生成 琴，名字为 琴',
-        '生成 琴，名字为 琴',
-        '生成 琴，名字为 琴',
         '生成 安柏，名字为 安柏',
     ]);
     expect(settings.roleBatch.index).toBe(2);
+    expect(settings.roleBatch.items.map((item) => item.failed)).toEqual([true, false]);
 });
 
 it('reorders and parks waiting roles during a request without changing its identity', async () => {
@@ -468,20 +467,20 @@ it('restores a parked earlier role to the end while another role is generating',
     ]);
 });
 
-it('skips a role after three empty replies, continues, and retries it on the next run', async () => {
+it('skips an empty reply, continues, and retries the failed role on the next run', async () => {
     vi.useFakeTimers();
-    const { settings, host, runner, notify } = setup([
-        { text: '  ' },
-        { text: '  ' },
-        { text: '  ' },
-        { text: '完成' },
-    ]);
+    const { settings, host, runner, notify } = setup([{ text: '  ' }, { text: '完成' }]);
     settings.roleNames = '琴\n安柏';
     const task = runner.start();
     await vi.runAllTimersAsync();
     await task;
-    expect(host.generateRoleReply).toHaveBeenCalledTimes(4);
-    expect(settings.roleBatch.items[0]).toMatchObject({ name: '琴', failed: true, error: '没有返回内容' });
+    expect(host.generateRoleReply).toHaveBeenCalledTimes(2);
+    expect(settings.roleBatch.items[0]).toMatchObject({
+        name: '琴',
+        failed: true,
+        processing: false,
+        error: '没有返回内容',
+    });
     expect(settings.roleBatch.items[1]).toMatchObject({ name: '安柏', processed: true, failed: false });
     expect(notify).toHaveBeenCalledWith('warning', expect.stringContaining('仍有 1 项未完成'));
     expect(settings.isRunning).toBe(false);
@@ -489,8 +488,8 @@ it('skips a role after three empty replies, continues, and retries it on the nex
     const retry = runner.start();
     await vi.runAllTimersAsync();
     await retry;
-    expect(host.generateRoleReply).toHaveBeenCalledTimes(5);
-    expect(host.generateRoleReply.mock.calls[4][1]).toContain('琴');
+    expect(host.generateRoleReply).toHaveBeenCalledTimes(3);
+    expect(host.generateRoleReply.mock.calls[2][1]).toContain('琴');
     expect(settings.roleBatch.items[0]).toMatchObject({ failed: false, error: null });
 });
 
@@ -506,19 +505,14 @@ it('marks explicit truncation and continues without retrying that character', as
     expect(settings.roleBatch.items.map((item) => item.failed)).toEqual([true, false]);
 });
 
-it('retries an empty truncation signal three times before moving to the next role', async () => {
+it('skips an empty truncation signal and moves to the next role', async () => {
     vi.useFakeTimers();
-    const { settings, host, runner } = setup([
-        { text: '', truncated: true },
-        { text: '', truncated: true },
-        { text: '', truncated: true },
-        { text: '完成' },
-    ]);
+    const { settings, host, runner } = setup([{ text: '', truncated: true }, { text: '完成' }]);
     settings.roleNames = '琴\n安柏';
     const task = runner.start();
     await vi.runAllTimersAsync();
     await task;
-    expect(host.generateRoleReply).toHaveBeenCalledTimes(4);
+    expect(host.generateRoleReply).toHaveBeenCalledTimes(2);
     expect(settings.roleBatch.items.map((item) => item.failed)).toEqual([true, false]);
 });
 
