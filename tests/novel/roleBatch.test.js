@@ -414,6 +414,60 @@ it('retries the same name twice and advances after the third attempt succeeds', 
     expect(settings.roleBatch.index).toBe(2);
 });
 
+it('reorders and parks waiting roles during a request without changing its identity', async () => {
+    vi.useFakeTimers();
+    const { settings, host, runner } = setup();
+    let finish;
+    host.generateRoleReply.mockImplementationOnce(() => new Promise((resolve) => (finish = resolve)));
+    const task = runner.start();
+    await vi.advanceTimersByTimeAsync(1);
+    const [first, second, third] = settings.roleBatch.items;
+    expect(settings.roleBatch.dispatch.itemId).toBe(first.id);
+    runner.editQueue('top', third.id);
+    runner.editQueue('park', second.id);
+    expect(settings.roleBatch.dispatch.itemId).toBe(first.id);
+    finish({ text: '正文', swipe: 0 });
+    await vi.runAllTimersAsync();
+    await task;
+    expect(host.generateRoleReply.mock.calls.map((call) => call[1])).toEqual([
+        '生成 琴，名字为 琴',
+        '生成 丽莎，名字为 丽莎',
+    ]);
+    expect(settings.roleBatch.items.find((item) => item.id === second.id).parked).toBe(true);
+    runner.editQueue('restore', second.id);
+    const next = runner.start();
+    await vi.runAllTimersAsync();
+    await next;
+    expect(host.generateRoleReply.mock.calls.at(-1)[1]).toBe('生成 安柏，名字为 安柏');
+});
+
+it('restores a parked earlier role to the end while another role is generating', async () => {
+    vi.useFakeTimers();
+    const { settings, host, runner } = setup();
+    let finish;
+    host.generateRoleReply.mockImplementationOnce(async () => {
+        runner.editQueue('park', settings.roleBatch.items[1].id);
+        return { text: '正文' };
+    });
+    host.generateRoleReply.mockImplementationOnce(() => new Promise((resolve) => (finish = resolve)));
+    const task = runner.start();
+    await vi.advanceTimersByTimeAsync(10);
+    const parked = settings.roleBatch.items.find((item) => item.name === '安柏');
+    const activeId = settings.roleBatch.dispatch.itemId;
+    runner.editQueue('restore', parked.id);
+    expect(settings.roleBatch.items[settings.roleBatch.index].id).toBe(activeId);
+    runner.addQueueNames(['诺艾尔']);
+    finish({ text: '正文' });
+    await vi.runAllTimersAsync();
+    await task;
+    expect(host.generateRoleReply.mock.calls.map((call) => call[1])).toEqual([
+        '生成 琴，名字为 琴',
+        '生成 丽莎，名字为 丽莎',
+        '生成 安柏，名字为 安柏',
+        '生成 诺艾尔，名字为 诺艾尔',
+    ]);
+});
+
 it('skips a role after three empty replies, continues, and retries it on the next run', async () => {
     vi.useFakeTimers();
     const { settings, host, runner, notify } = setup([

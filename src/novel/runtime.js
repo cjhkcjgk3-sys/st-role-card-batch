@@ -899,7 +899,7 @@ export function initNovelUI(host) {
         const count = checklistSelection.size;
         $('#nag-btn-role-checklist-add')
             .text(`➕ 加入名单（${count}）`)
-            .prop('disabled', !count || settings.isRunning || fileOperation);
+            .prop('disabled', !count || fileOperation);
     }
 
     /** Re-render only when the roster, library, search or open state changed (not on the 1 s refresh). */
@@ -947,13 +947,26 @@ export function initNovelUI(host) {
     }
 
     function addChecklistSelection() {
-        if (settings.isRunning || fileOperation) return toastr.warning('请先停止任务，再修改角色名单');
+        if (fileOperation) return;
         if (settings.generationMode !== 'role-batch') return;
         const library = settings.roleImageLibrary;
         if (!hasChecklistRoles(library)) return;
         const order = library.checklist.roles;
         const names = order.filter((name) => checklistSelection.has(name));
         if (!names.length) return toastr.info('请先勾选要加入的角色');
+        if (settings.isRunning) {
+            try {
+                roleRunner.addQueueNames(names);
+                $('#nag-set-prompt').val(settings.roleNames);
+                saveSettings();
+                checklistSelection.clear();
+                updateUI();
+                toastr.success('已加入队列');
+            } catch (error) {
+                toastr.warning(error.message);
+            }
+            return;
+        }
         const result = addNamesToRoster(settings.roleNames, names);
         settings.roleNames = result.text;
         $('#nag-set-prompt').val(settings.roleNames);
@@ -1322,7 +1335,9 @@ export function initNovelUI(host) {
         if (batchMode) renderChecklistPicker();
         const archiveNames = Array.isArray(settings.roleArchive) ? settings.roleArchive : [];
         const archiveNameMatcher = getArchiveMatcher(archiveNames, imageLibrary?.workNames);
-        const total = batchMode ? roleNames.length : settings.totalChapters;
+        const total = batchMode
+            ? roleNames.length - (batch?.items || []).filter((item) => item.parked).length
+            : settings.totalChapters;
         let completed = batchMode ? 0 : settings.currentChapter;
         if (batchMode && batch) {
             const cached = progressCountCache;
@@ -1402,11 +1417,22 @@ export function initNovelUI(host) {
         $('#nag-total-label').text(batchMode ? '角色总数（自动）' : '目标章节');
         $('#nag-prompt-label').text(batchMode ? '角色名单（每行一个）' : '提示词');
         $('#nag-role-results').toggle(batchMode);
-        roleRowsPage = Math.min(roleRowsPage, Math.max(0, Math.ceil(roleNames.length / ROLE_ROWS_PAGE) - 1));
+        const visibleIndices = roleNames.map((_, index) => index).filter((index) => !batch?.items[index]?.parked);
+        const parked = (batch?.items || []).filter((item) => item.parked);
+        $('#nag-parked-count').text(`（${parked.length}）`);
+        $('#nag-parked-list').html(
+            parked
+                .map(
+                    (item) =>
+                        `<div class="nag-role-status-row"><span>${escapeHtml(item.name)}</span><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="restore">放回队列</button></div>`,
+                )
+                .join('') || '<small class="nag-hint">没有暂移角色</small>',
+        );
+        roleRowsPage = Math.min(roleRowsPage, Math.max(0, Math.ceil(visibleIndices.length / ROLE_ROWS_PAGE) - 1));
         const rowStart = roleRowsPage * ROLE_ROWS_PAGE;
         const shownRows = batchMode
-            ? roleNames.slice(rowStart, rowStart + ROLE_ROWS_PAGE).map((name, offset) => {
-                  const index = rowStart + offset;
+            ? visibleIndices.slice(rowStart, rowStart + ROLE_ROWS_PAGE).map((index) => {
+                  const name = roleNames[index];
                   const item = batch?.items[index] || {};
                   const suffix = item.processing ? ` 第 ${batch.attempt}/3 次尝试` : '';
                   const roleState = resolveRoleStatus(item, archiveNameMatcher.has(name));
@@ -1416,13 +1442,23 @@ export function initNovelUI(host) {
                   const failureMark = item.error
                       ? ` <span class="nag-role-failure" data-index="${index}" title="${escapeAttribute(item.error)}">⚠</span>`
                       : '';
+                  const queueEligible =
+                      item.id &&
+                      !item.processing &&
+                      !item.failed &&
+                      !roleState.complete &&
+                      (item.parked || !settings.isRunning || index >= batch.index);
+                  const queueControls = queueEligible
+                      ? `<details class="nag-queue-menu"><summary>操作</summary><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="top">置顶</button><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="park">暂移</button></details><button type="button" class="menu_button nag-queue-drag" data-id="${escapeAttribute(item.id)}" aria-label="长按拖动排序">☰</button>`
+                      : '';
                   const controls =
-                      roleCorrection && item.id
+                      queueControls +
+                      (roleCorrection && item.id
                           ? `<span class="nag-role-correction-actions"><button type="button" class="menu_button nag-role-status-set" data-index="${index}" data-status="complete">✓ 完成</button><button type="button" class="menu_button nag-role-status-set" data-index="${index}" data-status="failed">✗ 失败</button><button type="button" class="menu_button nag-role-status-set" data-index="${index}" data-status="auto">自动</button></span>`
-                          : '';
+                          : '');
                   return {
                       key: `${index}:${name}`,
-                      main: `${roleStatusIcon(roleState.status)} ${index + 1}. ${escapeHtml(name)}${suffix}${manual}${archivedMark}${failureMark}`,
+                      main: `${item.parked ? '⏸ 暂移' : roleStatusIcon(roleState.status)} ${index + 1}. ${escapeHtml(name)}${suffix}${manual}${archivedMark}${failureMark}`,
                       controls,
                       slot: roleImageSlot(name, index, imageLibrary),
                   };
@@ -1430,11 +1466,14 @@ export function initNovelUI(host) {
             : [];
         // 只计算当前页，避免隐藏行仍重复进行名称、图片匹配和 HTML 构造。
         renderRoleRows($('#nag-role-results')[0], shownRows);
-        renderPager('nag-role-rows', batchMode ? roleNames.length : 0, roleRowsPage);
+        renderPager('nag-role-rows', batchMode ? visibleIndices.length : 0, roleRowsPage);
         {
             // 「跳到当前」只在名单跨页时出现；已经在那一页就禁用
-            const total = batchMode ? roleNames.length : 0;
-            const currentIndex = Math.min(Math.max(0, batch?.index ?? 0), Math.max(0, total - 1));
+            const total = batchMode ? visibleIndices.length : 0;
+            const currentIndex = Math.max(
+                0,
+                visibleIndices.findIndex((index) => index >= (batch?.index ?? 0)),
+            );
             $('#nag-role-rows-jump')
                 .prop('disabled', roleRowsPage === Math.floor(currentIndex / ROLE_ROWS_PAGE))
                 .attr('title', total ? `跳到正在生成的第 ${currentIndex + 1} 个（共 ${total} 个）` : '');
@@ -1590,6 +1629,8 @@ export function initNovelUI(host) {
                         </div>
                         <small id="nag-role-correction-hint" class="nag-hint" style="display:none">只修改名单状态，不删除回复。标记失败后可继续生成；标记完成不会创建正文，没有正文时无法导出该角色。</small>
                         <div id="nag-role-results" class="ttw-memory-queue" style="display:none"></div>
+                        <div class="nag-btn-row"><input id="nag-queue-add-name" class="text_pole" placeholder="输入角色名"><button type="button" id="nag-queue-add" class="menu_button">加入队尾</button></div>
+                        <details id="nag-parked"><summary>暂移角色<span id="nag-parked-count"></span></summary><div id="nag-parked-list" class="ttw-memory-queue"></div></details>
                         <div id="nag-role-rows-pager" class="nag-btn-row" style="display:none"><button type="button" id="nag-role-rows-prev" class="menu_button">上一页</button><small id="nag-role-rows-page" class="nag-hint" aria-live="polite"></small><button type="button" id="nag-role-rows-jump" class="menu_button">跳到当前</button><button type="button" id="nag-role-rows-more" class="menu_button">下一页</button></div>
                     </div>
                 </div>
@@ -1846,11 +1887,30 @@ export function initNovelUI(host) {
             const names = settings.roleBatch?.names || parseRoleNames(settings.roleNames);
             if (!names.length) return;
             const index = Math.min(names.length - 1, Math.max(0, settings.roleBatch?.index ?? 0));
-            roleRowsPage = Math.floor(index / ROLE_ROWS_PAGE);
+            const visible = names.map((_, i) => i).filter((i) => !settings.roleBatch?.items[i]?.parked);
+            const position = Math.max(
+                0,
+                visible.findIndex((i) => i >= index),
+            );
+            roleRowsPage = Math.floor(position / ROLE_ROWS_PAGE);
             updateUI();
             // 翻到那一页后把正在生成的行滚到视野中间，省得自己找
             const row = $(`#nag-role-results .nag-role-status-row[data-row-key^="${index}:"]`)[0];
             row?.scrollIntoView({ block: 'center' });
+        });
+        $('#nag-queue-add').on('click', () => {
+            const input = $('#nag-queue-add-name');
+            const name = String(input.val() || '').trim();
+            if (!name) return;
+            try {
+                roleRunner.addQueueNames([name]);
+                input.val('');
+                $('#nag-set-prompt').val(settings.roleNames);
+                saveSettings();
+                updateUI();
+            } catch (error) {
+                toastr.warning(error.message);
+            }
         });
         $('#nag-archive-more, #nag-archive-prev').on('click', function () {
             archiveRowsPage = Math.max(0, archiveRowsPage + (this.id.endsWith('-prev') ? -1 : 1));
@@ -1860,6 +1920,66 @@ export function initNovelUI(host) {
         $('#nag-role-results').on('click', '.nag-role-failure', function () {
             const item = settings.roleBatch?.items?.[Number(this.dataset.index)];
             toastr.warning(item?.error || '这一项没有记录失败原因', undefined, { timeOut: 8000 });
+        });
+        $('#nag-role-results, #nag-parked-list').on('click', '.nag-queue-action', function () {
+            try {
+                roleRunner.editQueue(this.dataset.action, this.dataset.id);
+                $('#nag-set-prompt').val(settings.roleNames);
+                saveSettings();
+                updateUI();
+            } catch (error) {
+                toastr.warning(error.message);
+            }
+        });
+        let queueDrag = null;
+        $('#nag-role-results').on('pointerdown', '.nag-queue-drag', function (event) {
+            const original = event.originalEvent;
+            const handle = this;
+            const startX = original.clientX;
+            const startY = original.clientY;
+            queueDrag = { id: this.dataset.id, pointer: original.pointerId, active: false, target: null };
+            const drag = queueDrag;
+            drag.timer = setTimeout(() => {
+                if (queueDrag !== drag) return;
+                drag.active = true;
+                handle.setPointerCapture(drag.pointer);
+                handle.classList.add('nag-drag-active');
+            }, 400);
+            const move = (e) => {
+                if (queueDrag !== drag || e.pointerId !== drag.pointer) return;
+                if (!drag.active) {
+                    if (Math.hypot(e.clientX - startX, e.clientY - startY) > 8) clearTimeout(drag.timer);
+                    return;
+                }
+                e.preventDefault();
+                const target = document.elementFromPoint(e.clientX, e.clientY)?.closest('.nag-role-status-row');
+                drag.target = target?.querySelector('.nag-queue-drag')?.dataset.id || null;
+                const list = document.getElementById('nag-role-results');
+                const rect = list.getBoundingClientRect();
+                if (e.clientY < rect.top + 40) list.scrollTop -= 15;
+                if (e.clientY > rect.bottom - 40) list.scrollTop += 15;
+            };
+            const finish = (e) => {
+                if (e.pointerId !== drag.pointer) return;
+                clearTimeout(drag.timer);
+                document.removeEventListener('pointermove', move);
+                document.removeEventListener('pointerup', finish);
+                document.removeEventListener('pointercancel', finish);
+                handle.classList.remove('nag-drag-active');
+                queueDrag = null;
+                if (!drag.active || !drag.target || drag.target === drag.id || e.type === 'pointercancel') return;
+                try {
+                    roleRunner.editQueue('move', drag.id, drag.target);
+                    $('#nag-set-prompt').val(settings.roleNames);
+                    saveSettings();
+                    updateUI();
+                } catch (error) {
+                    toastr.warning(error.message);
+                }
+            };
+            document.addEventListener('pointermove', move, { passive: false });
+            document.addEventListener('pointerup', finish);
+            document.addEventListener('pointercancel', finish);
         });
         $('#nag-role-results').on('click', '.nag-role-status-set', async function () {
             if (settings.isRunning || fileOperation) return;

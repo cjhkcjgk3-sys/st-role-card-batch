@@ -756,6 +756,16 @@
     gap: 6px;
 }
 
+.nag-queue-drag {
+    touch-action: none;
+    cursor: grab;
+}
+
+.nag-queue-drag.nag-drag-active {
+    cursor: grabbing;
+    outline: 2px solid #8bc34a;
+}
+
 .nag-role-status-row {
     flex-wrap: nowrap;
 }

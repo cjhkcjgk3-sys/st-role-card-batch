@@ -146,7 +146,7 @@ export function createRoleBatchRunner({
         preparing = true;
         const settings = getSettings();
         const initial = host.snapshot();
-        const run = { identity: initial.identity, controller: new AbortController(), paused: false };
+        const run = { identity: initial.identity, controller: new AbortController(), paused: false, queueRun: true };
         active = run;
         settings.isRunning = true;
         settings.isPaused = false;
@@ -234,7 +234,7 @@ export function createRoleBatchRunner({
                     assertCurrent(run);
                 }
                 assertCurrent(run);
-                if (roleComplete(batch.items[batch.index])) {
+                if (batch.items[batch.index].parked || roleComplete(batch.items[batch.index])) {
                     batch.index++;
                     continue;
                 }
@@ -333,7 +333,7 @@ export function createRoleBatchRunner({
                 if (!completed) break;
                 await abortableDelay(Math.max(0, settings.replyWaitTime || 0), run.controller.signal);
             }
-            const remaining = batch.items.filter((item) => !roleComplete(item)).length;
+            const remaining = batch.items.filter((item) => !item.parked && !roleComplete(item)).length;
             notify(
                 remaining ? 'warning' : 'success',
                 remaining
@@ -697,6 +697,102 @@ export function createRoleBatchRunner({
         previewPending: () => !!state()?.preview,
         restore,
         saveInput,
+        editQueue(action, itemId, targetId) {
+            const batch = state();
+            if (
+                !batch ||
+                preparing ||
+                (active && !active.queueRun) ||
+                batch.preview ||
+                batch.identity !== host.snapshot().identity
+            )
+                throw new Error('当前任务无法调整队列，请回到原聊天并等待准备完成');
+            if (!active && host.snapshot().generating) throw new Error('请等待酒馆生成结束');
+            if (!active && batch.pending) throw new Error('上一轮请求尚未确认，请先核对聊天');
+            const itemIndex = batch.items.findIndex((item) => item.id === itemId);
+            const item = batch.items[itemIndex];
+            const boundary = active ? batch.index + (batch.items[batch.index]?.processing ? 1 : 0) : 0;
+            if (
+                !item ||
+                item.processing ||
+                ((roleComplete(item) || item.failed) && !(action === 'restore' && item.parked)) ||
+                (active && itemIndex < boundary && !(action === 'restore' && item.parked))
+            )
+                throw new Error('只能调整待生成的角色');
+            const previous = structuredClone(batch);
+            const settings = getSettings();
+            const oldNames = settings.roleNames;
+            try {
+                if (action === 'park') item.parked = true;
+                else if (action === 'restore') {
+                    if (!item.parked) return;
+                    item.parked = false;
+                    batch.items.splice(itemIndex, 1);
+                    if (active && itemIndex < batch.index) batch.index--;
+                    batch.items.push(item);
+                } else if (action === 'top' || action === 'move') {
+                    if (item.parked) throw new Error('请先将角色放回队列');
+                    const targetIndex =
+                        action === 'top' ? boundary : batch.items.findIndex((entry) => entry.id === targetId);
+                    if (targetIndex < boundary || targetIndex < 0) throw new Error('只能移动到待生成队列');
+                    const target = batch.items[targetIndex];
+                    if (
+                        action === 'move' &&
+                        (target.parked || target.processing || target.failed || roleComplete(target))
+                    )
+                        throw new Error('只能移动到待生成的角色旁');
+                    batch.items.splice(itemIndex, 1);
+                    batch.items.splice(targetIndex, 0, item);
+                } else throw new Error('无效的队列操作');
+                batch.names = batch.items.map((entry) => entry.name);
+                settings.roleNames = batch.names.join('\n');
+                batch.inputNames = settings.roleNames;
+                if (!active) batch.index = nextRoleIndex(batch);
+                checkpoint();
+            } catch (error) {
+                Object.assign(batch, previous);
+                settings.roleNames = oldNames;
+                throw error;
+            }
+        },
+        addQueueNames(names) {
+            const batch = state();
+            if (
+                !batch ||
+                preparing ||
+                (active && !active.queueRun) ||
+                batch.preview ||
+                batch.identity !== host.snapshot().identity
+            )
+                throw new Error('当前任务无法调整队列，请回到原聊天并等待准备完成');
+            if (!active && host.snapshot().generating) throw new Error('请等待酒馆生成结束');
+            if (!active && batch.pending) throw new Error('上一轮请求尚未确认，请先核对聊天');
+            const previous = structuredClone(batch);
+            const settings = getSettings();
+            const oldNames = settings.roleNames;
+            try {
+                const existing = new Set(batch.names);
+                for (const name of parseRoleNames(names.join('\n'))) {
+                    if (existing.has(name)) continue;
+                    existing.add(name);
+                    const oldIndex = (batch.history || []).findIndex((item) => item.name === name);
+                    batch.items.push(
+                        oldIndex >= 0 ? batch.history.splice(oldIndex, 1)[0] : { id: newIdentity('role'), name },
+                    );
+                }
+                batch.names = batch.items.map((item) => item.name);
+                settings.roleNames = batch.names.join('\n');
+                batch.inputNames = settings.roleNames;
+                const currentIndex = batch.index;
+                applyArchiveSkips(batch, settings.roleArchive, settings.roleImageLibrary?.workNames);
+                if (active) batch.index = currentIndex;
+                checkpoint();
+            } catch (error) {
+                Object.assign(batch, previous);
+                settings.roleNames = oldNames;
+                throw error;
+            }
+        },
         async setRoleArchive(nextArchive) {
             if (active || preparing) throw new Error('请先停止任务，再修改已完成角色名录');
             restore();

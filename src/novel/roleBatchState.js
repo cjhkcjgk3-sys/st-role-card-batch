@@ -104,7 +104,7 @@ export function unidentifiedRolePageSignature(batch, message) {
         .join(',');
 }
 export const nextRoleIndex = (batch) => {
-    const index = batch.items.findIndex((item) => !roleComplete(item));
+    const index = batch.items.findIndex((item) => !item.parked && !roleComplete(item));
     return index < 0 ? batch.names.length : index;
 };
 

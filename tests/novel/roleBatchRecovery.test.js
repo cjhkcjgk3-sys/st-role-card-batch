@@ -176,6 +176,34 @@ it('storage failure prevents dispatch, and corrupt recovery is not silently used
     expect(broken.host.generateRoleReply).not.toHaveBeenCalled();
 });
 
+it('persists a parked role across reload and rolls back queue edits when storage fails', async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    const first = f.create();
+    f.host.generateRoleReply.mockImplementationOnce(async () => {
+        first.runner.pause();
+        return { text: '正文', swipe: 0 };
+    });
+    const task = first.runner.start();
+    await vi.advanceTimersByTimeAsync(20);
+    const parkedId = first.settings.roleBatch.items[2].id;
+    first.runner.editQueue('park', parkedId);
+    expect(f.recovery.read().items.find((item) => item.id === parkedId).parked).toBe(true);
+    const savedSetItem = f.storage.setItem;
+    f.storage.setItem = () => {
+        throw new Error('quota');
+    };
+    expect(() => first.runner.editQueue('restore', parkedId)).toThrow();
+    expect(first.settings.roleBatch.items.find((item) => item.id === parkedId).parked).toBe(true);
+    f.storage.setItem = savedSetItem;
+    first.runner.stop();
+    await vi.runAllTimersAsync();
+    await task;
+    const reopened = f.create();
+    reopened.runner.restore();
+    expect(reopened.settings.roleBatch.items.find((item) => item.id === parkedId).parked).toBe(true);
+});
+
 it('passes the same validation settings to generation, resume and reset', async () => {
     vi.useFakeTimers();
     const f = fixture();
