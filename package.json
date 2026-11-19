@@ -1,6 +1,6 @@
 {
   "name": "st-role-card-batch",
-  "version": "2.0.7",
+  "version": "2.0.8",
   "private": true,
   "type": "module",
   "description": "SillyTavern 扩展 — 角色卡批量生成",

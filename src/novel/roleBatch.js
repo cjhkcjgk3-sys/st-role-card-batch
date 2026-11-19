@@ -790,11 +790,12 @@ export function createRoleBatchRunner({
             const itemIndex = batch.items.findIndex((item) => item.id === itemId);
             const item = batch.items[itemIndex];
             const boundary = active ? batch.index + (batch.items[batch.index]?.processing ? 1 : 0) : 0;
+            const isRestoreAction = action === 'restore' || action === 'restore-origin';
             if (
                 !item ||
                 item.processing ||
-                ((roleComplete(item) || item.failed) && !(action === 'restore' && item.parked)) ||
-                (active && itemIndex < boundary && !(action === 'restore' && item.parked))
+                ((roleComplete(item) || item.failed) && !(isRestoreAction && item.parked)) ||
+                (active && itemIndex < boundary && !(isRestoreAction && item.parked))
             )
                 throw new Error('只能调整待生成的角色');
             const previous = structuredClone(batch);
@@ -802,7 +803,10 @@ export function createRoleBatchRunner({
             const oldNames = settings.roleNames;
             try {
                 if (action === 'park') item.parked = true;
-                else if (action === 'restore') {
+                else if (action === 'restore-origin') {
+                    if (!item.parked) return;
+                    item.parked = false;
+                } else if (action === 'restore') {
                     if (!item.parked) return;
                     item.parked = false;
                     batch.items.splice(itemIndex, 1);

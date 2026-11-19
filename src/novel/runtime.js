@@ -115,7 +115,7 @@ export function initNovelUI(host) {
     let progressCountCache = null;
     let duplicateNamesCache = null;
     let unknownPagesCache = null;
-    const pluginVersion = '2.0.7';
+    const pluginVersion = '2.0.8';
     function invalidateRoleArchive() {
         archiveRevision++;
         archiveMatcherCache = null;
@@ -1469,7 +1469,7 @@ export function initNovelUI(host) {
                         const reason = item.error
                             ? ` <span class="nag-role-failure" data-id="${escapeAttribute(item.id)}" title="${escapeAttribute(item.error)}">⚠</span>`
                             : '';
-                        return `<div class="nag-role-status-row"><span>${icon} ${escapeHtml(item.name)}${reason}</span><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="restore">放回队列</button></div>`;
+                        return `<div class="nag-role-status-row"><span class="nag-role-status-name">${icon} ${escapeHtml(item.name)}${reason}</span><span class="nag-role-row-controls"><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="restore-origin">放回原处</button><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="restore">放回队尾</button></span></div>`;
                     })
                     .join('') || '<small class="nag-hint">没有暂移角色</small>',
             );

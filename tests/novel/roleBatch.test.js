@@ -938,3 +938,25 @@ it('fails and parks a card whose tokenCount is below minRoleTokens even when tag
     expect(onRoleComplete).toHaveBeenCalledTimes(1);
     expect(onRoleComplete).toHaveBeenCalledWith('安柏');
 });
+
+it('restore-origin keeps a parked or failed role in its original slot while restore moves it to the tail', async () => {
+    vi.useFakeTimers();
+    const { settings, runner } = setup([{ text: '' }, { text: '完成B' }, { text: '完成C' }]);
+    settings.roleNames = '琴\n安柏\n丽莎';
+    const first = runner.start();
+    await vi.runAllTimersAsync();
+    await first;
+    // 琴失败自动暂移，此时仍在原索引 0
+    const qin = settings.roleBatch.items.find((item) => item.name === '琴');
+    expect(qin.parked).toBe(true);
+    runner.editQueue('restore-origin', qin.id);
+    expect(settings.roleBatch.items.map((item) => item.name)).toEqual(['琴', '安柏', '丽莎']);
+    expect(settings.roleBatch.items[0]).toMatchObject({ name: '琴', parked: false, failed: true });
+    expect(settings.roleBatch.index).toBe(0);
+
+    // 再次暂移后点放回队尾，应移动到末尾
+    settings.roleBatch.items[0].parked = true;
+    runner.editQueue('restore', qin.id);
+    expect(settings.roleBatch.items.map((item) => item.name)).toEqual(['安柏', '丽莎', '琴']);
+    expect(settings.roleBatch.items[2]).toMatchObject({ name: '琴', parked: false });
+});
