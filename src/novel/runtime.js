@@ -110,7 +110,7 @@ export function initNovelUI(host) {
     let archiveMatcherCache = null;
     let renderedArchiveKey = null;
     let progressCountCache = null;
-    const pluginVersion = '2.0.2';
+    const pluginVersion = '2.0.3';
     function invalidateRoleArchive() {
         archiveRevision++;
         archiveMatcherCache = null;
@@ -1776,6 +1776,7 @@ export function initNovelUI(host) {
                             </div>
                             <div class="nag-module-body">
                                 <div class="nag-module-desc">AI回复完成后，等待总结等插件处理完成</div>
+                                <small class="nag-hint">角色之间随机等待 5～20 秒；若回复后等待设置更长，则按较长时间等待。网络中断自动继续前等待 20～30 秒，累计中断 3 次后停止。</small>
                                 <div class="nag-setting-row">
                                     <div class="nag-setting-item">
                                         <label>回复后等待 (ms)</label>

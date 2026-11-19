@@ -122,7 +122,7 @@ it('marks the first batch after a confirmed restart as reviewed, only once', asy
     expect(seen).toEqual([false, true, false]);
 });
 
-function setup(replies = [{ text: '结果' }]) {
+function setup(replies = [{ text: '结果' }], options = {}) {
     const settings = { roleNames: '琴\n安柏\n丽莎', totalChapters: 3, replyWaitTime: 0, roleBatch: null };
     const snapshot = { identity: 'chat-a', generating: false };
     let index = 0;
@@ -145,9 +145,141 @@ function setup(replies = [{ text: '结果' }]) {
         onChange: vi.fn(),
         onStats: vi.fn(),
         onRoleComplete: archived,
+        randomWaitMs: () => 0,
+        ...options,
     });
     return { settings, host, snapshot, runner, notify, archived };
 }
+
+it('waits the configured random interval before dispatching the next role', async () => {
+    vi.useFakeTimers();
+    const { runner, settings, host } = setup([{ text: '结果' }], { randomWaitMs: () => 15000 });
+    settings.roleNames = '琴\n安柏';
+    const task = runner.start();
+    await vi.advanceTimersByTimeAsync(14999);
+    expect(host.generateRoleReply).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await task;
+    expect(host.generateRoleReply).toHaveBeenCalledTimes(2);
+});
+
+it.each([
+    [0, 5000],
+    [0.999999, 20000],
+])('keeps the random role delay within 5–20 seconds', async (random, delay) => {
+    vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(random);
+    try {
+        const { runner, settings, host } = setup([{ text: '结果' }], { randomWaitMs: undefined });
+        settings.roleNames = '琴\n安柏';
+        const task = runner.start();
+        await vi.advanceTimersByTimeAsync(delay - 1);
+        expect(host.generateRoleReply).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(1);
+        await task;
+        expect(host.generateRoleReply).toHaveBeenCalledTimes(2);
+    } finally {
+        randomSpy.mockRestore();
+    }
+});
+
+it('waits before recovery, reconciles uncertain requests, and stops at three interruptions', async () => {
+    vi.useFakeTimers();
+    const timeout = () => Object.assign(new Error('超时'), { code: 'GENERATION_TIMEOUT', uncertain: true });
+    const { runner, settings, host, notify } = setup([timeout(), timeout(), timeout()], {
+        recoveryWaitMs: () => 20000,
+    });
+    host.reconcileRoleBatch = vi.fn(async (batch) => {
+        batch.pending = false;
+    });
+    const task = runner.start();
+    await vi.advanceTimersByTimeAsync(19999);
+    expect(host.generateRoleReply).toHaveBeenCalledTimes(1);
+    await vi.runAllTimersAsync();
+    await task;
+    expect(host.generateRoleReply).toHaveBeenCalledTimes(3);
+    expect(settings.isRunning).toBe(false);
+    expect(notify).toHaveBeenCalledWith('warning', expect.stringContaining('累计 3 次'));
+    expect(settings.roleBatch.pending).toBe(true);
+});
+
+it.each([
+    [0, 20000],
+    [0.999999, 30000],
+])('waits 20–30 seconds before automatic recovery', async (random, delay) => {
+    vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(random);
+    try {
+        const timeout = Object.assign(new Error('超时'), { code: 'GENERATION_TIMEOUT', uncertain: true });
+        const { runner, settings, host } = setup([timeout, { text: '结果' }]);
+        settings.roleNames = '琴\n安柏';
+        host.reconcileRoleBatch = vi.fn(async (batch) => {
+            batch.pending = false;
+        });
+        const task = runner.start();
+        await vi.advanceTimersByTimeAsync(delay - 1);
+        expect(host.generateRoleReply).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(1);
+        await task;
+        expect(host.generateRoleReply).toHaveBeenCalledTimes(2);
+    } finally {
+        randomSpy.mockRestore();
+    }
+});
+
+it('manual stop cancels an automatic recovery wait', async () => {
+    vi.useFakeTimers();
+    const timeout = Object.assign(new Error('超时'), { code: 'GENERATION_TIMEOUT', uncertain: true });
+    const { runner, host } = setup([timeout], { recoveryWaitMs: () => 25000 });
+    host.reconcileRoleBatch = vi.fn(async (batch) => {
+        batch.pending = false;
+    });
+    const task = runner.start();
+    await vi.advanceTimersByTimeAsync(1000);
+    runner.stop();
+    await vi.runAllTimersAsync();
+    await task;
+    expect(host.generateRoleReply).toHaveBeenCalledTimes(1);
+    expect(host.reconcileRoleBatch).toHaveBeenCalledTimes(1);
+});
+
+it('uses a result confirmed during recovery without generating the same role again', async () => {
+    vi.useFakeTimers();
+    const timeout = Object.assign(new Error('超时'), { code: 'GENERATION_TIMEOUT', uncertain: true });
+    const { runner, settings, host, archived } = setup([timeout, { text: '下一角色' }], {
+        recoveryWaitMs: () => 25000,
+    });
+    settings.roleNames = '琴\n安柏';
+    host.reconcileRoleBatch = vi.fn(async (batch) => {
+        if (batch.pending) Object.assign(batch.items[batch.index], { processed: true, failed: false, swipe: 0 });
+        batch.pending = false;
+    });
+    const task = runner.start();
+    await vi.advanceTimersByTimeAsync(24999);
+    expect(host.generateRoleReply).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await task;
+    expect(host.generateRoleReply.mock.calls.map((call) => call[1])).toEqual([
+        '生成 琴，名字为 琴',
+        '生成 安柏，名字为 安柏',
+    ]);
+    expect(archived.mock.calls.map((call) => call[0])).toEqual(['琴', '安柏']);
+});
+
+it('stops with the request pending when recovery cannot confirm the previous generation', async () => {
+    vi.useFakeTimers();
+    const timeout = Object.assign(new Error('超时'), { code: 'GENERATION_TIMEOUT', uncertain: true });
+    const { runner, settings, host } = setup([timeout], { recoveryWaitMs: () => 20000 });
+    host.reconcileRoleBatch = vi.fn(async (batch) => {
+        if (batch.pending) throw new Error('酒馆仍在生成');
+    });
+    const task = runner.start();
+    await vi.runAllTimersAsync();
+    await task;
+    expect(host.generateRoleReply).toHaveBeenCalledTimes(1);
+    expect(settings.roleBatch.pending).toBe(true);
+    expect(settings.isRunning).toBe(false);
+});
 
 it('normalizes the finished-role archive by trimmed unique names', () => {
     expect(normalizeRoleArchive([' 琴 ', '琴', '', '安柏', null, { name: ' 丽莎 ' }])).toEqual(['琴', '安柏', '丽莎']);

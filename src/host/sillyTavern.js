@@ -814,7 +814,13 @@ export function createSillyTavernHost({
                 reject(error);
             };
             timeout = setTimeout(
-                () => fail(Object.assign(new Error('生成超时，请确认酒馆已停止后再处理'), { uncertain: true })),
+                () =>
+                    fail(
+                        Object.assign(new Error('生成超时，请确认酒馆已停止后再处理'), {
+                            uncertain: true,
+                            code: 'GENERATION_TIMEOUT',
+                        }),
+                    ),
                 timeoutMs,
             );
             watch = setInterval(() => {

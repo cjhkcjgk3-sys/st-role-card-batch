@@ -27,6 +27,8 @@ export function createRoleBatchRunner({
     recovery,
     onRoleComplete = () => {},
     onRoleArchiveChange = () => {},
+    randomWaitMs = () => 5000 + Math.floor(Math.random() * 15001),
+    recoveryWaitMs = () => 20000 + Math.floor(Math.random() * 10001),
 }) {
     let active = null;
     let preparing = false;
@@ -228,6 +230,7 @@ export function createRoleBatchRunner({
         }
         try {
             const batch = state();
+            let recoveryFailures = 0;
             while (batch.index < batch.names.length) {
                 while (run.paused) {
                     await abortableDelay(100, run.controller.signal);
@@ -240,6 +243,7 @@ export function createRoleBatchRunner({
                 }
                 const name = batch.names[batch.index];
                 const attempt = 1;
+                let recoveredAfterStop = false;
                 assertCurrent(run);
                 batch.attempt = attempt;
                 batch.items[batch.index] = { ...batch.items[batch.index], name, processing: true };
@@ -313,14 +317,64 @@ export function createRoleBatchRunner({
                         failed: true,
                         error: error.message,
                     };
-                    if (error.uncertain) throw error;
-                    stats.errors.push({ chapter: batch.index + 1, error: error.message });
-                    notify('warning', `${name}：生成失败，已跳过并继续生成下一个角色`);
+                    const recoverableStop =
+                        error.code === 'GENERATION_TIMEOUT' ||
+                        error.code === 'NOT_CONNECTED' ||
+                        error.phase === 'select-swipe';
+                    if (recoverableStop) {
+                        let recovered = false;
+                        while (!recovered && recoveryFailures < 3) {
+                            recoveryFailures++;
+                            if (recoveryFailures >= 3) break;
+                            notify('warning', `${name}：任务中断，等待后自动继续（中断 ${recoveryFailures}/3）`);
+                            await abortableDelay(recoveryWaitMs(), run.controller.signal);
+                            assertCurrent(run);
+                            while (run.paused) {
+                                await abortableDelay(100, run.controller.signal);
+                                assertCurrent(run);
+                            }
+                            try {
+                                const current = host.snapshot();
+                                if (current.generating !== false || current.connected === false)
+                                    throw new Error('无法确认酒馆已停止生成或尚未连接');
+                                if (batch.pending) {
+                                    if (!host.reconcileRoleBatch) throw new Error('无法确认上一轮的结果');
+                                    await host.reconcileRoleBatch(batch, validationOptions());
+                                    assertCurrent(run);
+                                    if (batch.pending) throw new Error('上一轮仍未确认结束');
+                                }
+                                recovered = true;
+                            } catch (recoveryError) {
+                                assertCurrent(run);
+                                onError(recoveryError, { phase: 'auto-recovery', roleIndex: batch.index + 1 });
+                            }
+                        }
+                        if (!recovered) throw new Error('任务中断累计 3 次，已停止；请检查酒馆连接和聊天结果');
+                        recoveredAfterStop = true;
+                    } else if (error.uncertain) throw error;
+                    if (roleComplete(batch.items[batch.index])) {
+                        onRoleComplete(name);
+                        notify('info', `${name}：已恢复并确认生成结果，继续下一个角色`);
+                    } else {
+                        stats.errors.push({ chapter: batch.index + 1, error: error.message });
+                        notify('warning', `${name}：生成失败，已跳过并继续生成下一个角色`);
+                    }
                     batch.index++;
                     batch.dispatch = null;
                     checkpoint();
                 }
-                await abortableDelay(Math.max(0, settings.replyWaitTime || 0), run.controller.signal);
+                let hasNextRole = false;
+                for (let i = batch.index; i < batch.items.length; i++) {
+                    if (!batch.items[i].parked && !roleComplete(batch.items[i])) {
+                        hasNextRole = true;
+                        break;
+                    }
+                }
+                if (!recoveredAfterStop && hasNextRole)
+                    await abortableDelay(
+                        Math.max(0, settings.replyWaitTime || 0, randomWaitMs()),
+                        run.controller.signal,
+                    );
             }
             const remaining = batch.items.filter((item) => !item.parked && !roleComplete(item)).length;
             notify(

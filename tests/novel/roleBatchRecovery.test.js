@@ -36,6 +36,7 @@ function fixture() {
             onChange: vi.fn(),
             onStats: vi.fn(),
             notify: vi.fn(),
+            randomWaitMs: () => 0,
         });
         return { settings, runner };
     };
