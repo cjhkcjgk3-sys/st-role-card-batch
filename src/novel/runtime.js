@@ -109,8 +109,11 @@ export function initNovelUI(host) {
     let archiveRevision = 0;
     let archiveMatcherCache = null;
     let renderedArchiveKey = null;
+    let renderedParkedKey = null;
     let progressCountCache = null;
-    const pluginVersion = '2.0.5';
+    let duplicateNamesCache = null;
+    let unknownPagesCache = null;
+    const pluginVersion = '2.0.6';
     function invalidateRoleArchive() {
         archiveRevision++;
         archiveMatcherCache = null;
@@ -148,9 +151,9 @@ export function initNovelUI(host) {
     }
 
     function escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML.replace(/\n/g, '<br>');
+        return String(text ?? '')
+            .replace(/[&<>]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[character])
+            .replace(/\n/g, '<br>');
     }
 
     function escapeAttribute(value) {
@@ -1310,9 +1313,13 @@ export function initNovelUI(host) {
         roleSelection?.refresh();
         const batchMode = settings.generationMode === 'role-batch';
         const batch = settings.roleBatch;
-        if (batchMode && batch && !settings.isRunning && !fileOperation) {
+        if (batchMode && batch && !settings.isRunning && !fileOperation && settings.roleNames !== batch.inputNames) {
             const parsed = parseRoleNames(settings.roleNames);
-            if (batch.names && JSON.stringify(batch.names) !== JSON.stringify(parsed)) {
+            const namesChanged =
+                !Array.isArray(batch.names) ||
+                batch.names.length !== parsed.length ||
+                batch.names.some((name, index) => name !== parsed[index]);
+            if (namesChanged) {
                 updateRoleNames(batch, parsed);
                 applyArchiveSkips(batch, settings.roleArchive, settings.roleImageLibrary?.workNames);
                 batch.inputNames = settings.roleNames;
@@ -1373,7 +1380,16 @@ export function initNovelUI(host) {
         $(
             '#nag-archive-input, #nag-btn-archive-add, #nag-btn-archive-collect, #nag-btn-archive-clear, .nag-archive-remove',
         ).prop('disabled', busy);
-        const repeatedNames = batchMode ? duplicateRoleNames(settings.roleNames) : [];
+        let repeatedNames = [];
+        if (batchMode) {
+            const rawNames = String(settings.roleNames || '');
+            if (duplicateNamesCache?.raw === rawNames) {
+                repeatedNames = duplicateNamesCache.result;
+            } else {
+                repeatedNames = duplicateRoleNames(rawNames);
+                duplicateNamesCache = { raw: rawNames, result: repeatedNames };
+            }
+        }
         $('#nag-role-duplicate-hint')
             .toggle(repeatedNames.length > 0)
             .text(
@@ -1384,10 +1400,25 @@ export function initNovelUI(host) {
         const currentBatch = batch?.identity === host.snapshot().identity ? batch : null;
         const chat = batchMode ? host.getChat() : null;
         const result = currentBatch?.resultFloor != null ? chat?.[currentBatch.resultFloor] : chat?.at(-1);
-        const unknownPages =
-            batchMode && result && !result.is_user && !result.is_system
-                ? countUnidentifiedRolePages(currentBatch, result)
-                : 0;
+        let unknownPages = 0;
+        if (batchMode && result && !result.is_user && !result.is_system) {
+            const swipesLen = Array.isArray(result.swipes) ? result.swipes.length : 1;
+            const swipeId = result.swipe_id ?? 0;
+            const rev = currentBatch?.revision ?? -1;
+            if (
+                unknownPagesCache &&
+                unknownPagesCache.batch === currentBatch &&
+                unknownPagesCache.rev === rev &&
+                unknownPagesCache.result === result &&
+                unknownPagesCache.swipesLen === swipesLen &&
+                unknownPagesCache.swipeId === swipeId
+            ) {
+                unknownPages = unknownPagesCache.count;
+            } else {
+                unknownPages = countUnidentifiedRolePages(currentBatch, result);
+                unknownPagesCache = { batch: currentBatch, rev, result, swipesLen, swipeId, count: unknownPages };
+            }
+        }
         $('#nag-role-unidentified-hint')
             .toggle(unknownPages > 0)
             .text(
@@ -1425,17 +1456,23 @@ export function initNovelUI(host) {
         $('#nag-parked-count').text(`（${parked.length}）`);
         $('#nag-parked-restore-all').prop('disabled', !parked.length || fileOperation);
         $('#nag-parked-copy').prop('disabled', !parked.length);
-        $('#nag-parked-list').html(
-            parked
-                .map((item) => {
-                    const icon = item.failed ? '❌' : '⏸';
-                    const reason = item.error
-                        ? ` <span class="nag-role-failure" data-id="${escapeAttribute(item.id)}" title="${escapeAttribute(item.error)}">⚠</span>`
-                        : '';
-                    return `<div class="nag-role-status-row"><span>${icon} ${escapeHtml(item.name)}${reason}</span><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="restore">放回队列</button></div>`;
-                })
-                .join('') || '<small class="nag-hint">没有暂移角色</small>',
-        );
+        const parkedKey = parked
+            .map((item) => `${item.id}:${item.name}:${item.failed ? 1 : 0}:${item.error || ''}`)
+            .join('\u0000');
+        if (parkedKey !== renderedParkedKey) {
+            renderedParkedKey = parkedKey;
+            $('#nag-parked-list').html(
+                parked
+                    .map((item) => {
+                        const icon = item.failed ? '❌' : '⏸';
+                        const reason = item.error
+                            ? ` <span class="nag-role-failure" data-id="${escapeAttribute(item.id)}" title="${escapeAttribute(item.error)}">⚠</span>`
+                            : '';
+                        return `<div class="nag-role-status-row"><span>${icon} ${escapeHtml(item.name)}${reason}</span><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="restore">放回队列</button></div>`;
+                    })
+                    .join('') || '<small class="nag-hint">没有暂移角色</small>',
+            );
+        }
         roleRowsPage = Math.min(roleRowsPage, Math.max(0, Math.ceil(visibleIndices.length / ROLE_ROWS_PAGE) - 1));
         const rowStart = roleRowsPage * ROLE_ROWS_PAGE;
         const shownRows = batchMode
@@ -2638,8 +2675,19 @@ export function initNovelUI(host) {
             notify: (type, message) => toastr[type](message),
         });
         roleSelection.refresh();
+        // 运行期间每秒只更新已用/剩余时间，避免整页重算和 DOM 重排；状态变化已由 onChange 驱动完整 updateUI。
         refreshTimer = setInterval(() => {
-            if (settings.isRunning) updateUI();
+            if (!settings.isRunning || document.hidden) return;
+            if (!generationStats.startTime || generationStats.chaptersGenerated <= 0) return;
+            const elapsed = Date.now() - generationStats.startTime;
+            const avg = elapsed / generationStats.chaptersGenerated;
+            const batch = settings.roleBatch;
+            const total = batch
+                ? batch.names.length - (batch.items || []).filter((item) => item.parked).length
+                : settings.totalChapters;
+            const completed = progressCountCache?.completed ?? settings.currentChapter;
+            $('#nag-time-elapsed').text(formatDuration(elapsed));
+            $('#nag-time-remaining').text(formatDuration(avg * Math.max(0, total - completed)));
         }, 1000);
         log('扩展已加载', 'success');
     });
