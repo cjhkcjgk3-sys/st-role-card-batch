@@ -1,5 +1,5 @@
 import { abortableDelay } from '../core/requestPolicy.js';
-import { isRoleCardTruncated } from '../novel/tagFilters.js';
+import { endsWithClosingMarker, isRoleCardTruncated } from '../novel/tagFilters.js';
 import { createRoleResultIsolation, ROLE_BATCH_REQUEST } from './resultIsolation.js';
 import { hashRoleResult, RESULT_HASH_KEY } from './roleResultIntegrity.js';
 import { countUnidentifiedRolePages, unidentifiedRolePageSignature } from '../novel/roleBatchState.js';
@@ -168,17 +168,18 @@ export function createSillyTavernHost({
             // receipt immediately mark the task complete again. A receipt for the currently
             // pending attempt is still recoverable after a reload.
             const explicitlyRequeued = item.swipe === null && !item.archived && item.manualStatus == null;
-            // 回执里的 status 是「生成那一刻」的快照：当时判成截断（invalid）或流被中断（partial），
-            // 卡片后来补完、或者判定规则调整过，就永远算不成完成，界面上一直显示没做。
-            // 这里以正文为准重新校验，通过就认；pending（请求还没回来）仍然不算，避免把上一页正文当结果。
-            const recoverableStatus = new Set(['invalid', 'partial']);
+            // 回执里的 status 是「生成那一刻」的快照：
+            // - invalid：若正文后来补完或校验通过，可重新认领；
+            // - partial（流被明确中断）：不能仅靠宽松校验洗白，只有正文以显式结束标记收尾且通过校验时才认领；
+            // - pending（请求还没回来）：仍然不算，避免把上一页正文当结果。
             const matching = (text, swipe) => {
                 const receipt = reply?.swipe_info?.[swipe]?.extra?.nag_role_batch;
                 if (explicitlyRequeued && (!pendingAttempt || receipt?.attemptId !== pendingAttempt)) return false;
                 if (receipt?.taskId !== batch.id || receipt.itemId !== item.id || receipt.previewId) return false;
                 if (!text?.trim() || text.trim() === '...') return false;
                 if (receipt.origin !== 'worldbook' && isRoleCardTruncated(text, validationOptions)) return false;
-                return receipt.status === 'complete' || recoverableStatus.has(receipt.status);
+                if (receipt.status === 'complete' || receipt.status === 'invalid') return true;
+                return receipt.status === 'partial' && endsWithClosingMarker(text);
             };
             const completedAttempt = pendingAttempt
                 ? swipes.findLastIndex(
@@ -276,6 +277,72 @@ export function createSillyTavernHost({
         for (const [item, update] of updates) Object.assign(item, update);
         batch.pending = false;
         batch.dispatch = null;
+    }
+
+    /** 扫描当前批次结果楼层中所有已绑定备选页的完整性，用于一键核对纠偏。 */
+    async function auditRoleBatch(batch, validationOptions = {}) {
+        if (!batch || snapshot().identity !== batch.identity) throw new Error('请回到原批次聊天后再核对备选页');
+        if (roleGeneration || snapshot().generating === true) throw new Error('请等待酒馆当前生成结束');
+        const messages = getChat();
+        if (!messages?.[batch.promptFloor]?.is_user) throw new Error('任务对应的提示词楼层已变化，请先核对聊天');
+        if (batch.resultFloor == null && messages.length === batch.promptFloor + 2 && !messages.at(-1)?.is_user)
+            batch.resultFloor = batch.promptFloor + 1;
+        const reply = batch.resultFloor == null ? null : messages[batch.resultFloor];
+        if (!reply) return [];
+        if (reply.is_user || reply.is_system || messages.length !== batch.resultFloor + 1)
+            throw new Error('任务对应的回复楼层已变化，请先核对聊天');
+        const swipes = Array.isArray(reply.swipes) && reply.swipes.length ? reply.swipes : [reply.mes];
+        let changed = false;
+        const results = [];
+        for (const item of batch.items || []) {
+            const matchesItem = (swipe) => {
+                if (!Number.isInteger(swipe) || swipe < 0 || swipe >= swipes.length) return false;
+                const receipt = reply.swipe_info?.[swipe]?.extra?.nag_role_batch;
+                if (receipt?.previewId) return false;
+                if (receipt) return receipt.taskId === batch.id && receipt.itemId === item.id;
+                return Boolean(item.legacy && item.swipe === swipe);
+            };
+            let swipe = matchesItem(item.swipe) ? item.swipe : -1;
+            if (swipe < 0) {
+                for (let index = swipes.length - 1; index >= 0; index--) {
+                    if (matchesItem(index)) {
+                        swipe = index;
+                        break;
+                    }
+                }
+            }
+            if (swipe < 0) continue;
+            const text = String(swipes[swipe] || '');
+            const receipt = reply.swipe_info?.[swipe]?.extra?.nag_role_batch;
+            const empty = !text.trim() || text.trim() === '...';
+            const truncated =
+                empty ||
+                (receipt?.origin !== 'worldbook' && isRoleCardTruncated(text, validationOptions)) ||
+                (receipt?.status === 'partial' && !endsWithClosingMarker(text));
+            if (truncated) {
+                if (receipt && receipt.status === 'complete') {
+                    receipt.status = 'invalid';
+                    if ((reply.swipe_id ?? 0) === swipe) {
+                        reply.extra ??= {};
+                        reply.extra.nag_role_batch = receipt;
+                    }
+                    changed = true;
+                }
+            } else if (
+                receipt &&
+                (receipt.status === 'invalid' || (receipt.status === 'partial' && endsWithClosingMarker(text)))
+            ) {
+                receipt.status = 'complete';
+                if ((reply.swipe_id ?? 0) === swipe) {
+                    reply.extra ??= {};
+                    reply.extra.nag_role_batch = receipt;
+                }
+                changed = true;
+            }
+            results.push({ item, swipe, text, truncated });
+        }
+        if (changed) await getContext().saveChat();
+        return results;
     }
 
     async function restoreRoleTemplateIfEquals(batch, expected) {
@@ -1049,6 +1116,7 @@ export function createSillyTavernHost({
         deleteRoleImage,
         restoreRoleTemplate,
         reconcileRoleBatch,
+        auditRoleBatch,
         async confirmRoleRestart() {
             return !!(await getContext().Popup.show.confirm(
                 '从头生成全部角色',

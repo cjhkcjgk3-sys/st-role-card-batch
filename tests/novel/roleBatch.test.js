@@ -751,3 +751,123 @@ it('accepts complete quoted or HTML-formatted cards for names containing middots
     expect(host.generateRoleReply).toHaveBeenCalledTimes(2);
     expect(settings.roleBatch.items.map((item) => item.failed)).toEqual([false, false]);
 });
+
+it('records error and skips archive when a fenced card misses </character_design_complex> or [end]', async () => {
+    vi.useFakeTimers();
+    const onRoleComplete = vi.fn();
+    const { settings, runner } = setup(
+        [{ text: '```\n[start]\n<character_design_complex>\nname: 琴\n```', swipe: 0 }],
+        { onRoleComplete },
+    );
+    settings.roleNames = '琴';
+    const task = runner.start();
+    await vi.runAllTimersAsync();
+    await task;
+    expect(settings.roleBatch.items[0]).toMatchObject({
+        name: '琴',
+        failed: true,
+        error: '角色卡未闭合或内容截断',
+    });
+    expect(onRoleComplete).not.toHaveBeenCalled();
+});
+
+it('warns on YAML name mismatch without failing the card, and accepts work-prefixed or nickname matches', async () => {
+    vi.useFakeTimers();
+    const { settings, runner, notify } = setup([
+        {
+            text: '```\n[start]\n<character_design_complex>\nname: 丽莎\n</character_design_complex>\n[end]\n```',
+            swipe: 0,
+        },
+        {
+            text: '```\n[start]\n<character_design_complex>\nname: 雷电芽衣\nnicknames:\n  - 芽衣\n</character_design_complex>\n[end]\n```',
+            swipe: 1,
+        },
+    ]);
+    settings.roleNames = '琴\n崩坏三·雷电芽衣';
+    settings.roleImageLibrary = { workNames: ['崩坏三'] };
+    const task = runner.start();
+    await vi.runAllTimersAsync();
+    await task;
+    expect(settings.roleBatch.items[0]).toMatchObject({
+        name: '琴',
+        failed: false,
+        nameWarning: expect.stringContaining('丽莎'),
+    });
+    expect(settings.roleBatch.items[1]).toMatchObject({
+        name: '崩坏三·雷电芽衣',
+        failed: false,
+        nameWarning: null,
+    });
+    expect(notify).toHaveBeenCalledWith('warning', expect.stringContaining('备选页角色名为「丽莎」'));
+});
+
+it('auditReplies marks falsely completed truncated replies as failed, removes them from archive, and flags name mismatch', async () => {
+    const truncatedCard = '```\n[start]\n<character_design_complex>\nname: 琴\n[外貌]\n```';
+    const mismatchedCard =
+        '```\n[start]\n<character_design_complex>\nname: 丽莎\n</character_design_complex>\n[end]\n```';
+    const goodCard = '```\n[start]\n<character_design_complex>\nname: 芭芭拉\n</character_design_complex>\n[end]\n```';
+    const settings = {
+        roleNames: '琴\n安柏\n芭芭拉',
+        roleArchive: ['琴', '安柏'],
+        roleBatch: {
+            id: 'task-1',
+            identity: 'chat-1',
+            promptFloor: 1,
+            resultFloor: 2,
+            template: '生成 [[角色名]]',
+            names: ['琴', '安柏', '芭芭拉'],
+            index: 3,
+            items: [
+                { id: 'r1', name: '琴', processed: true, failed: false, swipe: 0 },
+                { id: 'r2', name: '安柏', processed: true, failed: false, swipe: 1 },
+                { id: 'r3', name: '芭芭拉', processed: true, failed: false, swipe: 2 },
+            ],
+            history: [],
+        },
+    };
+    const onRoleComplete = (name) => {
+        if (!settings.roleArchive.includes(name)) settings.roleArchive.push(name);
+    };
+    const notify = vi.fn();
+    const host = {
+        snapshot: () => ({ identity: 'chat-1', generating: false, connected: true }),
+        auditRoleBatch: vi.fn(async (batch) => [
+            { item: batch.items[0], swipe: 0, text: truncatedCard, truncated: true },
+            { item: batch.items[1], swipe: 1, text: mismatchedCard, truncated: false },
+            { item: batch.items[2], swipe: 2, text: goodCard, truncated: false },
+        ]),
+    };
+    const runner = createRoleBatchRunner({
+        getSettings: () => settings,
+        host,
+        onChange: vi.fn(),
+        notify,
+        onStats: vi.fn(),
+        onRoleComplete,
+        onRoleArchiveChange: vi.fn(),
+    });
+    const summary = await runner.auditReplies();
+    expect(summary).toEqual({
+        checked: 3,
+        truncatedFixed: 1,
+        archiveRemoved: 1,
+        archiveAdded: 1,
+        nameMismatches: 1,
+    });
+    expect(settings.roleBatch.items[0]).toMatchObject({
+        failed: true,
+        error: '角色卡未闭合或内容截断',
+        nameWarning: null,
+    });
+    expect(settings.roleBatch.items[1]).toMatchObject({
+        failed: false,
+        nameWarning: expect.stringContaining('丽莎'),
+    });
+    expect(settings.roleBatch.items[2]).toMatchObject({
+        failed: false,
+        nameWarning: null,
+    });
+    expect(settings.roleArchive).toEqual(['安柏', '芭芭拉']);
+    expect(settings.roleBatch.index).toBe(0);
+    expect(notify).toHaveBeenCalledWith('warning', expect.stringContaining('1 页截断已标失败'));
+});

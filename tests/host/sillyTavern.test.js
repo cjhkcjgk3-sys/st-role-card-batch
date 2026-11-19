@@ -505,6 +505,67 @@ it('does not modify a prompt or dispatch when Tavern has no API connection', asy
     expect(context.generate).not.toHaveBeenCalled();
 });
 
+it('does not promote a partial receipt unless the text ends with an explicit closing marker', async () => {
+    const { host, context } = batchSetup();
+    const partialText = 'name: 琴\nage: 22\n这是一段在流中断时停在句号上的半截设定。';
+    const completedText = '```\n[start]\n<character_design_complex>\nname: 琴\n</character_design_complex>\n[end]\n```';
+    context.chat[2].swipes = [partialText];
+    context.chat[2].mes = partialText;
+    context.chat[2].swipe_info = [
+        { extra: { nag_role_batch: { taskId: 'task-1', itemId: 'role-1', status: 'partial' } } },
+    ];
+    const batch = {
+        ...host.prepareRoleBatch(),
+        id: 'task-1',
+        identity: host.snapshot().identity,
+        names: ['琴'],
+        items: [{ id: 'role-1', name: '琴', processed: true, failed: true, swipe: 0 }],
+        pending: false,
+    };
+    await host.reconcileRoleBatch(batch);
+    expect(batch.items[0].failed).toBe(true);
+    expect(context.chat[2].swipe_info[0].extra.nag_role_batch.status).toBe('partial');
+
+    // 手动补全到 [end] 后，再核对可以升级为 complete
+    context.chat[2].swipes[0] = completedText;
+    context.chat[2].mes = completedText;
+    await host.reconcileRoleBatch(batch);
+    expect(batch.items[0]).toMatchObject({ processed: true, failed: false, swipe: 0 });
+    expect(context.chat[2].swipe_info[0].extra.nag_role_batch.status).toBe('complete');
+});
+
+it('audits bound reply pages and downgrades falsely completed truncated receipts without deleting replies', async () => {
+    const { host, context } = batchSetup();
+    const truncatedCard = '```\n[start]\n<character_design_complex>\nname: 琴\n```';
+    const completeCard =
+        '```\n[start]\n<character_design_complex>\nname: 安柏\n</character_design_complex>\n[end]\n```';
+    context.chat[2].swipes = [truncatedCard, completeCard];
+    context.chat[2].mes = completeCard;
+    context.chat[2].swipe_id = 1;
+    context.chat[2].swipe_info = [
+        { extra: { nag_role_batch: { taskId: 'task-1', itemId: 'role-1', status: 'complete' } } },
+        { extra: { nag_role_batch: { taskId: 'task-1', itemId: 'role-2', status: 'complete' } } },
+    ];
+    const batch = {
+        ...host.prepareRoleBatch(),
+        id: 'task-1',
+        identity: host.snapshot().identity,
+        names: ['琴', '安柏'],
+        items: [
+            { id: 'role-1', name: '琴', processed: true, failed: false, swipe: 0 },
+            { id: 'role-2', name: '安柏', processed: true, failed: false, swipe: 1 },
+        ],
+    };
+    const audited = await host.auditRoleBatch(batch);
+    expect(audited.map((entry) => ({ name: entry.item.name, truncated: entry.truncated }))).toEqual([
+        { name: '琴', truncated: true },
+        { name: '安柏', truncated: false },
+    ]);
+    expect(context.chat[2].swipe_info[0].extra.nag_role_batch.status).toBe('invalid');
+    expect(context.chat[2].swipes).toEqual([truncatedCard, completeCard]);
+    expect(context.saveChat).toHaveBeenCalled();
+});
+
 function workbenchSetup(existing = false) {
     const f = batchSetup(existing);
     const values = new Map();

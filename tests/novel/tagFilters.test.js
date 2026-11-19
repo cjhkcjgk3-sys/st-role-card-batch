@@ -1,5 +1,11 @@
 import { expect, it } from 'vitest';
-import { parseTagInput, applyTagFilters, isRoleCardTruncated } from '../../src/novel/tagFilters.js';
+import {
+    parseTagInput,
+    applyTagFilters,
+    endsWithClosingMarker,
+    extractRoleCardNames,
+    isRoleCardTruncated,
+} from '../../src/novel/tagFilters.js';
 
 it('preserves extraction and exclusion when moved out of the entry module', () => {
     expect(parseTagInput('正文，内容;备注')).toEqual(['正文', '内容', '备注']);
@@ -64,4 +70,83 @@ it('ignores decorative tags deep inside a long card', () => {
     const longBody = `${'设定内容。'.repeat(120)}\n<装饰标签>\n${'更多设定。'.repeat(120)}`;
     // 标签只检查开头的外层结构，正文深处的不成对标签不算截断
     expect(isRoleCardTruncated(`<character_design_complex>\n${longBody}\n</character_design_complex>`)).toBe(false);
+});
+
+it('detects truncated fenced [start]/<character_design_complex> cards accurately', () => {
+    const completeFenced = [
+        '```',
+        '[start]',
+        '<character_design_complex>',
+        'name: 雷电芽衣',
+        'nicknames:',
+        '  - 雷之律者',
+        '</character_design_complex>',
+        '[end]',
+        '```',
+    ].join('\n');
+    expect(endsWithClosingMarker(completeFenced)).toBe(true);
+    expect(isRoleCardTruncated(completeFenced)).toBe(false);
+
+    // 代码块提前闭合，但缺少 </character_design_complex> 和 [end]
+    const closedFenceMissingTag = ['```', '[start]', '<character_design_complex>', 'name: 雷电芽衣', '```'].join('\n');
+    expect(isRoleCardTruncated(closedFenceMissingTag)).toBe(true);
+
+    // 代码块和容器标签都闭合，但 [start] 没有配对 [end]
+    const missingEnd = [
+        '```',
+        '[start]',
+        '<character_design_complex>',
+        'name: 雷电芽衣',
+        '</character_design_complex>',
+        '```',
+    ].join('\n');
+    expect(isRoleCardTruncated(missingEnd)).toBe(true);
+
+    // 截断在普通方括号小节标题或 [start] 上，不能误判为显式结束标记
+    for (const marker of ['[start]', '[外貌]', '[性格]', '[核心信息]']) {
+        const truncatedAtHeader = `[start]\n<character_design_complex>\nname: 雷电芽衣\n${marker}`;
+        expect(endsWithClosingMarker(truncatedAtHeader)).toBe(false);
+        expect(isRoleCardTruncated(truncatedAtHeader)).toBe(true);
+    }
+
+    // 开头超过 500 字的思考过程后出现未闭合的 <character_design_complex>
+    const longThink = `<think>${'思考过程。'.repeat(150)}</think>\n<character_design_complex>\nname: 雷电芽衣\nage: 18`;
+    expect(isRoleCardTruncated(longThink)).toBe(true);
+
+    // 多个 <character_design_complex> 只闭合了一个
+    const secondUnclosed = [
+        '<character_design_complex>\nname: 角色A\n</character_design_complex>',
+        '<character_design_complex>\nname: 角色B\nage: 20',
+    ].join('\n');
+    expect(isRoleCardTruncated(secondUnclosed)).toBe(true);
+});
+
+it('extracts primary names and nicknames from YAML character cards', () => {
+    const card = [
+        '```yaml',
+        '[start]',
+        '<character_design_complex>',
+        '# 核心信息',
+        'name: "雷电芽衣（雷之律者）"',
+        'nicknames:',
+        '  - 芽衣',
+        '  - "煮饭婆"',
+        '  - 无',
+        'version: 1',
+        '</character_design_complex>',
+        '[end]',
+        '```',
+    ].join('\n');
+    expect(extractRoleCardNames(card)).toEqual({
+        primaryNames: ['雷电芽衣（雷之律者）'],
+        nicknames: ['芽衣', '煮饭婆'],
+        allNames: ['雷电芽衣（雷之律者）', '芽衣', '煮饭婆'],
+    });
+
+    // 非角色卡纯文本不误提取
+    expect(extractRoleCardNames('这是一段普通的纯文本回复，没有 YAML 名字字段。')).toEqual({
+        primaryNames: [],
+        nicknames: [],
+        allNames: [],
+    });
 });

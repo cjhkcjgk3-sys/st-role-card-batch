@@ -110,7 +110,7 @@ export function initNovelUI(host) {
     let archiveMatcherCache = null;
     let renderedArchiveKey = null;
     let progressCountCache = null;
-    const pluginVersion = '2.0.3';
+    const pluginVersion = '2.0.4';
     function invalidateRoleArchive() {
         archiveRevision++;
         archiveMatcherCache = null;
@@ -1398,6 +1398,9 @@ export function initNovelUI(host) {
         $('#nag-role-correction-toggle')
             .toggle(batchMode && !!batch)
             .prop('disabled', busy);
+        $('#nag-btn-audit-replies')
+            .toggle(batchMode && !!batch)
+            .prop('disabled', busy);
         $('#nag-btn-restore-prompt')
             .toggle(batchMode && !!batch)
             .prop('disabled', busy);
@@ -1438,9 +1441,10 @@ export function initNovelUI(host) {
                   const roleState = resolveRoleStatus(item, archiveNameMatcher.has(name));
                   const manual = roleState.manual ? '（手动）' : '';
                   const archivedMark = roleState.archived ? '（名录）' : '';
-                  // 失败原因以前只存在数据里、界面上看不到，用户只能看到一个 ❌
-                  const failureMark = item.error
-                      ? ` <span class="nag-role-failure" data-index="${index}" title="${escapeAttribute(item.error)}">⚠</span>`
+                  // 失败原因或名称不符警告以前只存在数据里、界面上看不到
+                  const issueText = item.error || item.nameWarning;
+                  const failureMark = issueText
+                      ? ` <span class="nag-role-failure" data-index="${index}" title="${escapeAttribute(issueText)}">⚠</span>`
                       : '';
                   const queueEligible =
                       item.id &&
@@ -1625,6 +1629,7 @@ export function initNovelUI(host) {
                         </div>
                         <div class="nag-btn-row">
                             <button type="button" id="nag-role-correction-toggle" class="menu_button" style="display:none">手动纠错</button>
+                            <button type="button" id="nag-btn-audit-replies" class="menu_button" style="display:none">核对备选页</button>
                             <button type="button" id="nag-btn-restore-prompt" class="menu_button" style="display:none">恢复原始提示词</button>
                         </div>
                         <small id="nag-role-correction-hint" class="nag-hint" style="display:none">只修改名单状态，不删除回复。标记失败后可继续生成；标记完成不会创建正文，没有正文时无法导出该角色。</small>
@@ -1920,7 +1925,17 @@ export function initNovelUI(host) {
         });
         $('#nag-role-results').on('click', '.nag-role-failure', function () {
             const item = settings.roleBatch?.items?.[Number(this.dataset.index)];
-            toastr.warning(item?.error || '这一项没有记录失败原因', undefined, { timeOut: 8000 });
+            toastr.warning(item?.error || item?.nameWarning || '这一项没有记录失败原因', undefined, { timeOut: 8000 });
+        });
+        $('#nag-btn-audit-replies').on('click', async () => {
+            if (settings.isRunning || fileOperation) return;
+            try {
+                await roleRunner.auditReplies();
+                saveSettings();
+                updateUI();
+            } catch (error) {
+                toastr.warning(error.message);
+            }
         });
         $('#nag-role-results, #nag-parked-list').on('click', '.nag-queue-action', function () {
             try {

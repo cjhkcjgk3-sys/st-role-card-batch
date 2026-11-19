@@ -1,5 +1,6 @@
 import { newIdentity } from '../core/chunkIdentity.js';
 import { createRoleNameMatcher, parseWithWorkKeys, workKeysOf } from './roleName.js';
+import { extractRoleCardNames } from './tagFilters.js';
 
 /** One precedence rule for task state, archive display and queue skipping. */
 export function resolveRoleStatus(item, archiveMatch = false) {
@@ -397,4 +398,21 @@ export function updateRoleNames(batch, names) {
     batch.names = names;
     batch.index = nextRoleIndex(batch);
     batch.attempt = 0;
+}
+
+/**
+ * 核对备选回复正文里提取到的角色名/别名是否与名单目标一致。
+ * 正文未包含可识别的 YAML name 字段时返回 null（不误报）；不一致时返回提示文案。
+ */
+export function detectRoleCardNameMismatch(expectedName, text, workNames = []) {
+    const target = String(expectedName || '').trim();
+    if (!target || typeof text !== 'string' || !text.trim()) return null;
+    const { primaryNames, allNames } = extractRoleCardNames(text);
+    if (!allNames.length) return null;
+    const cardMatcher = createRoleNameMatcher(allNames, workNames);
+    if (cardMatcher.has(target)) return null;
+    const expectedMatcher = createRoleNameMatcher([target], workNames);
+    if (allNames.some((candidate) => expectedMatcher.has(candidate))) return null;
+    const found = primaryNames[0] || allNames[0];
+    return `备选页角色名为「${found}」，与名单「${target}」不符，请核对`;
 }

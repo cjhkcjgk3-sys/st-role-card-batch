@@ -3,6 +3,7 @@ import { newIdentity } from '../core/chunkIdentity.js';
 import {
     applyArchiveSkips,
     applyRoleArchiveChanges,
+    detectRoleCardNameMismatch,
     hydrateRoleBatch,
     nextRoleIndex,
     normalizeRoleArchive,
@@ -187,8 +188,12 @@ export function createRoleBatchRunner({
                 if (restartIdentity === initial.identity) batch.restartReviewed = true;
             }
             restartIdentity = null;
-            if (host.reconcileRoleBatch) await host.reconcileRoleBatch(batch, validationOptions());
-            else if (batch.pending) throw new Error('上一轮尚未确认结束，请先查看聊天结果');
+            if (host.reconcileRoleBatch) {
+                await host.reconcileRoleBatch(batch, validationOptions());
+                for (const item of batch.items || []) {
+                    if (item.processed && !item.failed && !item.archived && item.name) onRoleComplete(item.name);
+                }
+            } else if (batch.pending) throw new Error('上一轮尚未确认结束，请先查看聊天结果');
             assertCurrent(run);
             await syncEditedTemplate(batch, run);
             assertCurrent(run);
@@ -264,33 +269,24 @@ export function createRoleBatchRunner({
                     assertCurrent(run);
                     batch.pending = false;
                     if (!reply.text?.trim()) throw reply.error || new Error('没有返回内容');
+                    const truncated = Boolean(reply.truncated || isRoleCardTruncated(reply.text, validationOptions()));
+                    const nameWarning = truncated
+                        ? null
+                        : detectRoleCardNameMismatch(name, reply.text, settings.roleImageLibrary?.workNames);
                     batch.items[batch.index] = {
                         ...batch.items[batch.index],
                         name,
                         legacy: false,
                         processing: false,
                         processed: true,
-                        manualStatus:
-                            reply.truncated || isRoleCardTruncated(reply.text, validationOptions())
-                                ? batch.items[batch.index].manualStatus
-                                : null,
-                        failed: Boolean(
-                            reply.truncated ||
-                            isRoleCardTruncated(reply.text, {
-                                minLength: settings.minChapterLength,
-                                expectedClosingTags: settings.expectedClosingTags,
-                            }),
-                        ),
-                        error: null,
+                        manualStatus: truncated ? batch.items[batch.index].manualStatus : null,
+                        failed: truncated,
+                        error: truncated ? '角色卡未闭合或内容截断' : null,
+                        nameWarning,
                         swipe: reply.swipe,
                     };
-                    if (!batch.items[batch.index].failed) onRoleComplete(batch.items[batch.index].name);
-                    const truncated =
-                        reply.truncated ||
-                        isRoleCardTruncated(reply.text, {
-                            minLength: settings.minChapterLength,
-                            expectedClosingTags: settings.expectedClosingTags,
-                        });
+                    if (!truncated) onRoleComplete(batch.items[batch.index].name);
+                    if (nameWarning) notify('warning', `${name}：${nameWarning}`);
                     if (truncated) stats.errors.push({ chapter: batch.index + 1, error: '角色卡未闭合或内容截断' });
                     batch.index++;
                     batch.dispatch = null;
@@ -492,6 +488,12 @@ export function createRoleBatchRunner({
                 failed: false,
                 manualStatus: null,
                 legacy: false,
+                error: null,
+                nameWarning: detectRoleCardNameMismatch(
+                    captured.name,
+                    reply.text,
+                    settings.roleImageLibrary?.workNames,
+                ),
                 swipe: captured.index,
             });
             // 单角色重生成也要收录：从失败状态重生成成功的角色否则不会进入名录
@@ -700,6 +702,12 @@ export function createRoleBatchRunner({
                     failed: false,
                     manualStatus: manualComplete ? 'complete' : null,
                     legacy: false,
+                    error: null,
+                    nameWarning: detectRoleCardNameMismatch(
+                        preview.name,
+                        result.text,
+                        getSettings().roleImageLibrary?.workNames,
+                    ),
                     swipe: preview.index,
                 });
                 // 用候选版本替换成功，同样要收录进名录
@@ -938,6 +946,92 @@ export function createRoleBatchRunner({
                 settings.roleArchive = previousArchive;
                 onRoleArchiveChange();
                 throw error;
+            } finally {
+                preparing = false;
+            }
+        },
+        async auditReplies() {
+            if (active || preparing) throw new Error('请先停止任务，再核对备选页');
+            restore();
+            const batch = state();
+            if (!batch || batch.identity !== host.snapshot().identity)
+                throw new Error('请回到原批次聊天后再核对备选页');
+            if (host.snapshot().generating === true) throw new Error('请等待酒馆当前生成结束');
+            assertNoPreview(batch);
+            if (!host.auditRoleBatch) throw new Error('当前宿主不支持备选页核对');
+            preparing = true;
+            const settings = getSettings();
+            const workNames = settings.roleImageLibrary?.workNames;
+            try {
+                const entries = await host.auditRoleBatch(batch, validationOptions());
+                let truncatedFixed = 0;
+                let archiveRemoved = 0;
+                let archiveAdded = 0;
+                let nameMismatches = 0;
+                let archiveChanged = false;
+                for (const entry of entries) {
+                    const { item } = entry;
+                    if (entry.truncated) {
+                        Object.assign(item, {
+                            processing: false,
+                            processed: true,
+                            failed: true,
+                            archived: false,
+                            manualStatus: null,
+                            error: '角色卡未闭合或内容截断',
+                            nameWarning: null,
+                            swipe: entry.swipe,
+                        });
+                        truncatedFixed++;
+                        const beforeLen = normalizeRoleArchive(settings.roleArchive).length;
+                        const nextArchive = removeRoleArchiveMatches(settings.roleArchive, item.name, workNames);
+                        if (nextArchive.length < beforeLen) {
+                            settings.roleArchive = nextArchive;
+                            archiveRemoved += beforeLen - nextArchive.length;
+                            archiveChanged = true;
+                        }
+                    } else {
+                        const nameWarning = detectRoleCardNameMismatch(item.name, entry.text, workNames);
+                        item.nameWarning = nameWarning;
+                        if (nameWarning) nameMismatches++;
+                        if (item.manualStatus !== 'failed') {
+                            Object.assign(item, {
+                                processing: false,
+                                processed: true,
+                                failed: false,
+                                error: null,
+                                swipe: entry.swipe,
+                            });
+                            const beforeLen = Array.isArray(settings.roleArchive) ? settings.roleArchive.length : 0;
+                            onRoleComplete(item.name);
+                            const afterLen = Array.isArray(settings.roleArchive) ? settings.roleArchive.length : 0;
+                            if (afterLen > beforeLen) archiveAdded += afterLen - beforeLen;
+                        }
+                    }
+                }
+                if (archiveChanged) onRoleArchiveChange();
+                batch.index = nextRoleIndex(batch);
+                checkpoint();
+                const summary = {
+                    checked: entries.length,
+                    truncatedFixed,
+                    archiveRemoved,
+                    archiveAdded,
+                    nameMismatches,
+                };
+                if (!entries.length) {
+                    notify('info', '当前批次还没有已绑定的备选回复可核对');
+                } else if (!truncatedFixed && !nameMismatches && !archiveAdded) {
+                    notify('success', `核对完成：已检查 ${entries.length} 页备选回复，全部完整且名称一致`);
+                } else {
+                    const parts = [`已检查 ${entries.length} 页`];
+                    if (truncatedFixed) parts.push(`${truncatedFixed} 页截断已标失败`);
+                    if (archiveRemoved) parts.push(`已从名录移出 ${archiveRemoved} 项`);
+                    if (archiveAdded) parts.push(`已补录名录 ${archiveAdded} 项`);
+                    if (nameMismatches) parts.push(`${nameMismatches} 页角色名与名单不符（已标 ⚠）`);
+                    notify(truncatedFixed || nameMismatches ? 'warning' : 'info', `核对完成：${parts.join('，')}`);
+                }
+                return summary;
             } finally {
                 preparing = false;
             }
