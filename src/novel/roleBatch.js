@@ -39,8 +39,16 @@ export function createRoleBatchRunner({
     const state = () => getSettings().roleBatch;
     const validationOptions = () => ({
         minLength: getSettings().minChapterLength,
+        minTokens: Math.max(0, Number(getSettings().minRoleTokens) || 0),
         expectedClosingTags: getSettings().expectedClosingTags,
     });
+    const truncationReason = (replyLike, options) => {
+        const minTokens = options?.minTokens || 0;
+        if (minTokens > 0 && Number.isFinite(replyLike?.tokenCount) && replyLike.tokenCount < minTokens) {
+            return `角色卡 Token 不足（${replyLike.tokenCount} < ${minTokens}）`;
+        }
+        return '角色卡未闭合或内容截断';
+    };
     function checkpoint() {
         const batch = state();
         try {
@@ -269,7 +277,12 @@ export function createRoleBatchRunner({
                     assertCurrent(run);
                     batch.pending = false;
                     if (!reply.text?.trim()) throw reply.error || new Error('没有返回内容');
-                    const truncated = Boolean(reply.truncated || isRoleCardTruncated(reply.text, validationOptions()));
+                    const options = validationOptions();
+                    const checkOptions = Number.isFinite(reply.tokenCount)
+                        ? { ...options, tokenCount: reply.tokenCount }
+                        : options;
+                    const truncated = Boolean(reply.truncated || isRoleCardTruncated(reply.text, checkOptions));
+                    const failureReason = truncated ? truncationReason(reply, options) : null;
                     const nameWarning = truncated
                         ? null
                         : detectRoleCardNameMismatch(name, reply.text, settings.roleImageLibrary?.workNames);
@@ -282,13 +295,13 @@ export function createRoleBatchRunner({
                         manualStatus: truncated ? batch.items[batch.index].manualStatus : null,
                         failed: truncated,
                         parked: truncated ? true : false,
-                        error: truncated ? '角色卡未闭合或内容截断' : null,
+                        error: failureReason,
                         nameWarning,
                         swipe: reply.swipe,
                     };
                     if (!truncated) onRoleComplete(batch.items[batch.index].name);
                     if (nameWarning) notify('warning', `${name}：${nameWarning}`);
-                    if (truncated) stats.errors.push({ chapter: batch.index + 1, error: '角色卡未闭合或内容截断' });
+                    if (truncated) stats.errors.push({ chapter: batch.index + 1, error: failureReason });
                     batch.index++;
                     batch.dispatch = null;
                     stats.chaptersGenerated++;
@@ -477,11 +490,15 @@ export function createRoleBatchRunner({
             );
             assertCurrent(run);
             if (!reply.text?.trim()) throw reply.error || new Error('酒馆没有返回正文，原角色内容已保留');
-            if (reply.truncated || isRoleCardTruncated(reply.text, validationOptions()))
+            const rerollOptions = validationOptions();
+            const rerollCheck = Number.isFinite(reply.tokenCount)
+                ? { ...rerollOptions, tokenCount: reply.tokenCount }
+                : rerollOptions;
+            if (reply.truncated || isRoleCardTruncated(reply.text, rerollCheck))
                 throw new Error(
                     reply.truncated
                         ? '新回复的流式输出未正常结束，原角色内容已保留；部分新回复保留在末尾'
-                        : '新回复未通过完整性检测（最小长度/结束标签/标签闭合），原角色内容已保留；新回复保留在末尾',
+                        : `${truncationReason(reply, rerollOptions)}，原角色内容已保留；新回复保留在末尾`,
                 );
             const committedResult = await host.commitRoleReroll(batch, captured, reply.swipe);
             committed = true;
@@ -580,7 +597,11 @@ export function createRoleBatchRunner({
         batch.pending = false;
         batch.dispatch = null;
         if (!reply.text?.trim()) throw reply.error || new Error('酒馆没有返回正文');
-        const incomplete = reply.truncated || isRoleCardTruncated(reply.text, validationOptions());
+        const previewOptions = validationOptions();
+        const previewCheck = Number.isFinite(reply.tokenCount)
+            ? { ...previewOptions, tokenCount: reply.tokenCount }
+            : previewOptions;
+        const incomplete = reply.truncated || isRoleCardTruncated(reply.text, previewCheck);
         notify(
             incomplete ? 'warning' : 'success',
             incomplete
@@ -1011,7 +1032,8 @@ export function createRoleBatchRunner({
             const settings = getSettings();
             const workNames = settings.roleImageLibrary?.workNames;
             try {
-                const entries = await host.auditRoleBatch(batch, validationOptions());
+                const options = validationOptions();
+                const entries = await host.auditRoleBatch(batch, options);
                 let truncatedFixed = 0;
                 let archiveRemoved = 0;
                 let archiveAdded = 0;
@@ -1027,7 +1049,7 @@ export function createRoleBatchRunner({
                             parked: true,
                             archived: false,
                             manualStatus: null,
-                            error: '角色卡未闭合或内容截断',
+                            error: truncationReason(entry, options),
                             nameWarning: null,
                             swipe: entry.swipe,
                         });

@@ -906,3 +906,35 @@ it('restoreAllParked moves multiple failed and manually parked roles to the tail
     expect(host.generateRoleReply).toHaveBeenCalledTimes(5);
     expect(settings.roleBatch.items.every((item) => item.processed && !item.failed && !item.parked)).toBe(true);
 });
+
+it('fails and parks a card whose tokenCount is below minRoleTokens even when tags are closed', async () => {
+    vi.useFakeTimers();
+    const onRoleComplete = vi.fn();
+    const closedShort = '```\n[start]\n<character_design_complex>\nname: 琴\n</character_design_complex>\n[end]\n```';
+    const closedLong = '```\n[start]\n<character_design_complex>\nname: 安柏\n</character_design_complex>\n[end]\n```';
+    const { settings, runner } = setup(
+        [
+            { text: closedShort, swipe: 0, tokenCount: 880 },
+            { text: closedLong, swipe: 1, tokenCount: 6500 },
+        ],
+        { onRoleComplete },
+    );
+    settings.roleNames = '琴\n安柏';
+    settings.minRoleTokens = 5000;
+    const task = runner.start();
+    await vi.runAllTimersAsync();
+    await task;
+    expect(settings.roleBatch.items[0]).toMatchObject({
+        name: '琴',
+        failed: true,
+        parked: true,
+        error: '角色卡 Token 不足（880 < 5000）',
+    });
+    expect(settings.roleBatch.items[1]).toMatchObject({
+        name: '安柏',
+        failed: false,
+        parked: false,
+    });
+    expect(onRoleComplete).toHaveBeenCalledTimes(1);
+    expect(onRoleComplete).toHaveBeenCalledWith('安柏');
+});

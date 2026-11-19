@@ -566,6 +566,38 @@ it('audits bound reply pages and downgrades falsely completed truncated receipts
     expect(context.saveChat).toHaveBeenCalled();
 });
 
+it('uses host getTokenCountAsync in auditRoleBatch to catch short but closed cards', async () => {
+    const { host, context } = batchSetup();
+    const shortClosed = '```\n[start]\n<character_design_complex>\nname: 琴\n</character_design_complex>\n[end]\n```';
+    const fullClosed = '```\n[start]\n<character_design_complex>\nname: 安柏\n</character_design_complex>\n[end]\n```';
+    context.getTokenCountAsync = vi.fn(async (text) => (text.includes('琴') ? 900 : 6200));
+    context.chat[2].swipes = [shortClosed, fullClosed];
+    context.chat[2].mes = fullClosed;
+    context.chat[2].swipe_id = 1;
+    context.chat[2].swipe_info = [
+        { extra: { nag_role_batch: { taskId: 'task-1', itemId: 'role-1', status: 'complete' } } },
+        { extra: { nag_role_batch: { taskId: 'task-1', itemId: 'role-2', status: 'complete' } } },
+    ];
+    const batch = {
+        ...host.prepareRoleBatch(),
+        id: 'task-1',
+        identity: host.snapshot().identity,
+        names: ['琴', '安柏'],
+        items: [
+            { id: 'role-1', name: '琴', processed: true, failed: false, swipe: 0 },
+            { id: 'role-2', name: '安柏', processed: true, failed: false, swipe: 1 },
+        ],
+    };
+    const audited = await host.auditRoleBatch(batch, { minTokens: 5000 });
+    expect(
+        audited.map((entry) => ({ name: entry.item.name, truncated: entry.truncated, tokenCount: entry.tokenCount })),
+    ).toEqual([
+        { name: '琴', truncated: true, tokenCount: 900 },
+        { name: '安柏', truncated: false, tokenCount: 6200 },
+    ]);
+    expect(context.chat[2].swipe_info[0].extra.nag_role_batch.status).toBe('invalid');
+});
+
 function workbenchSetup(existing = false) {
     const f = batchSetup(existing);
     const values = new Map();

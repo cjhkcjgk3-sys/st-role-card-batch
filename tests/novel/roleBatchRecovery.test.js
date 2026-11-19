@@ -215,7 +215,7 @@ it('passes the same validation settings to generation, resume and reset', async 
         expectedClosingTags: ['</card>'],
     });
     await run(runner);
-    const validation = { minLength: 10, expectedClosingTags: ['</card>'] };
+    const validation = { minLength: 10, minTokens: 0, expectedClosingTags: ['</card>'] };
     expect(f.host.reconcileRoleBatch).toHaveBeenCalledWith(settings.roleBatch, validation);
     expect(f.host.generateRoleReply.mock.calls[0][2].validationOptions).toEqual(validation);
     await runner.resetPending();

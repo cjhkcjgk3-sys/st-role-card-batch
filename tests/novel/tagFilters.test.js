@@ -3,6 +3,7 @@ import {
     parseTagInput,
     applyTagFilters,
     endsWithClosingMarker,
+    estimateTokenCount,
     extractRoleCardNames,
     isRoleCardTruncated,
 } from '../../src/novel/tagFilters.js';
@@ -149,4 +150,17 @@ it('extracts primary names and nicknames from YAML character cards', () => {
         nicknames: [],
         allNames: [],
     });
+});
+
+it('enforces minTokens even when a short card has valid closing markers', () => {
+    const shortClosedCard =
+        '```\n[start]\n<character_design_complex>\nname: 琴\n</character_design_complex>\n[end]\n```';
+    // 未启用 minTokens 时，结构完整即通过
+    expect(isRoleCardTruncated(shortClosedCard, { minTokens: 0 })).toBe(false);
+    // 启用 minTokens（例如 5000）后，哪怕有 [end]，Token 不足仍然判为截断
+    expect(isRoleCardTruncated(shortClosedCard, { minTokens: 5000, tokenCount: 850 })).toBe(true);
+    expect(isRoleCardTruncated(shortClosedCard, { minTokens: 5000, tokenCount: 5200 })).toBe(false);
+    // 未传入宿主 tokenCount 时使用本地估算值兜底
+    expect(estimateTokenCount(shortClosedCard)).toBeGreaterThan(10);
+    expect(isRoleCardTruncated(shortClosedCard, { minTokens: 5000 })).toBe(true);
 });

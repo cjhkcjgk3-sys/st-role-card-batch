@@ -73,6 +73,8 @@ export function initNovelUI(host) {
         autoSaveInterval: 50,
         maxRetries: 3,
         minChapterLength: 100,
+        // 角色卡最小 Token 下限（0 表示不启用；例如写卡助手可设为 5000，低于此值直接判截断失败）
+        minRoleTokens: 0,
 
         // 仅隔离当前批次的结果楼层，保留原生备选数据及纯文本查看。
         isolateRoleResult: false,
@@ -113,7 +115,7 @@ export function initNovelUI(host) {
     let progressCountCache = null;
     let duplicateNamesCache = null;
     let unknownPagesCache = null;
-    const pluginVersion = '2.0.6';
+    const pluginVersion = '2.0.7';
     function invalidateRoleArchive() {
         archiveRevision++;
         archiveMatcherCache = null;
@@ -1442,10 +1444,9 @@ export function initNovelUI(host) {
         $('#nag-btn-export-json').text('📦 JSON');
         $('#nag-btn-export-json').attr('title', '按下方楼层范围与标签设置导出 JSON');
         $('#nag-set-autosave, #nag-set-retries').prop('disabled', batchMode);
-        $('#nag-set-minlen, #nag-set-isolate-result, #nag-set-reroll-confirm, #nag-set-buffer-stream').prop(
-            'disabled',
-            busy,
-        );
+        $(
+            '#nag-set-minlen, #nag-set-min-tokens, #nag-set-isolate-result, #nag-set-reroll-confirm, #nag-set-buffer-stream',
+        ).prop('disabled', busy);
         $('.nag-result-isolation-setting').toggle(batchMode);
         $('#nag-minlen-label').text(batchMode ? '最小字数（防截断）' : '最小章节长度');
         $('#nag-total-label').text(batchMode ? '角色总数（自动）' : '目标章节');
@@ -1669,6 +1670,11 @@ export function initNovelUI(host) {
                             <label class="nag-checkbox-label" title="当前页及前后各一页正常预览，旧角色卡不进入下一次请求；预设、命令和上方消息照常使用"><input type="checkbox" id="nag-set-isolate-result"><span>隔离写卡结果（三页预览豁免）</span></label><small id="nag-result-preview-window" class="nag-hint" hidden></small>
                             <label class="nag-checkbox-label" title="开启：重生成此角色时新内容先作为候选版本放在末尾，确认“用这版替换”后才替换原页，可“再生成一版”比较或“放弃”。关闭：生成完成并校验通过后自动替换"><input type="checkbox" id="nag-set-reroll-confirm"><span>重生成后手动确认</span></label>
                         </div>
+                        <div class="nag-setting-item nag-result-isolation-setting">
+                            <label for="nag-set-min-tokens">最小 Token 数（防截断，0 关闭）</label>
+                            <input type="number" id="nag-set-min-tokens" min="0" step="500" placeholder="如 5000" style="width: 110px;">
+                        </div>
+                        <small class="nag-hint nag-result-isolation-setting">按酒馆 Token 计数检查每张角色卡；低于此值直接判截断失败并移入暂移区、不收录名录（修改后点「核对备选页」可复查已有回复）。</small>
                         <div class="nag-btn-row">
                             <button type="button" id="nag-role-correction-toggle" class="menu_button" style="display:none">手动纠错</button>
                             <button type="button" id="nag-btn-audit-replies" class="menu_button" style="display:none">核对备选页</button>
@@ -1879,7 +1885,7 @@ export function initNovelUI(host) {
                                     </div>
                                 </div>
                                 <div class="nag-setting-item">
-                                    <label>最小章节长度</label>
+                                    <label id="nag-minlen-label">最小字数（防截断）</label>
                                     <input type="number" id="nag-set-minlen" min="0" style="width: 100px;">
                                 </div>
                             </div>
@@ -2468,6 +2474,11 @@ export function initNovelUI(host) {
             settings.minChapterLength = +$(this).val() || 100;
             saveSettings();
         });
+        $('#nag-set-min-tokens').on('change', function () {
+            settings.minRoleTokens = Math.max(0, Math.floor(Number($(this).val()) || 0));
+            $(this).val(settings.minRoleTokens);
+            saveSettings();
+        });
         $('#nag-set-isolate-result').on('change', async function () {
             const wanted = $(this).prop('checked');
             const previous = settings.isolateRoleResult;
@@ -2531,6 +2542,7 @@ export function initNovelUI(host) {
         $('#nag-set-autosave').val(settings.autoSaveInterval);
         $('#nag-set-retries').val(settings.maxRetries);
         $('#nag-set-minlen').val(settings.minChapterLength);
+        $('#nag-set-min-tokens').val(Math.max(0, Number(settings.minRoleTokens) || 0));
         $('#nag-set-isolate-result').prop('checked', Boolean(settings.isolateRoleResult));
         $('#nag-set-reroll-confirm').prop('checked', settings.rerollConfirm !== false);
         $('#nag-set-buffer-stream').prop('checked', Boolean(settings.bufferModelStream));
@@ -2638,6 +2650,7 @@ export function initNovelUI(host) {
                                     try {
                                         const result = await host.saveMergedRolePreview(batch, comparison, draft, {
                                             minLength: settings.minChapterLength,
+                                            minTokens: Math.max(0, Number(settings.minRoleTokens) || 0),
                                             expectedClosingTags: settings.expectedClosingTags,
                                         });
                                         saved = true;

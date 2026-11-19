@@ -100,15 +100,43 @@ function unwrapOuterCodeFence(trimmed) {
     return body.replace(/\r?\n`{3,}\s*$/, '');
 }
 
+/** 当宿主未提供原生 tokenizer 时使用的中英文混合 Token 估算值。 */
+export function estimateTokenCount(text) {
+    if (!text || typeof text !== 'string') return 0;
+    const trimmed = text.trim();
+    if (!trimmed) return 0;
+    let cjk = 0;
+    let other = 0;
+    for (let index = 0; index < trimmed.length; index++) {
+        const code = trimmed.charCodeAt(index);
+        if (
+            (code >= 0x4e00 && code <= 0x9fff) ||
+            (code >= 0x3400 && code <= 0x4dbf) ||
+            (code >= 0x3040 && code <= 0x30ff) ||
+            (code >= 0xac00 && code <= 0xd7af)
+        ) {
+            cjk++;
+        } else if (code > 0x20) {
+            other++;
+        }
+    }
+    return Math.ceil(cjk * 0.8 + other * 0.3);
+}
+
 export function isRoleCardTruncated(text, options = {}) {
     if (!text || typeof text !== 'string') return false;
     const trimmed = text.trim();
     if (!trimmed || trimmed === '...') return false;
 
-    const { minLength = 0, expectedClosingTags = [] } = options;
+    const { minLength = 0, minTokens = 0, tokenCount = null, expectedClosingTags = [] } = options;
 
     if (minLength > 0 && trimmed.length < minLength) {
         return true;
+    }
+
+    if (minTokens > 0) {
+        const tokens = Number.isFinite(tokenCount) ? tokenCount : estimateTokenCount(trimmed);
+        if (tokens < minTokens) return true;
     }
 
     // 以显式结束标记收尾（例如单独一行的 [end]、[结束]、[/card]，其后可紧跟闭合 ```）：

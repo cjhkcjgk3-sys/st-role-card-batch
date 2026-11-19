@@ -1,5 +1,5 @@
 import { abortableDelay } from '../core/requestPolicy.js';
-import { endsWithClosingMarker, isRoleCardTruncated } from '../novel/tagFilters.js';
+import { endsWithClosingMarker, estimateTokenCount, isRoleCardTruncated } from '../novel/tagFilters.js';
 import { createRoleResultIsolation, ROLE_BATCH_REQUEST } from './resultIsolation.js';
 import { hashRoleResult, RESULT_HASH_KEY } from './roleResultIntegrity.js';
 import { countUnidentifiedRolePages, unidentifiedRolePageSignature } from '../novel/roleBatchState.js';
@@ -30,6 +30,20 @@ export function createSillyTavernHost({
 } = {}) {
     let roleGeneration = null;
     let roleIsolation = null;
+
+    async function countTokens(text) {
+        if (!text || typeof text !== 'string' || !text.trim()) return 0;
+        const fn = getContext()?.getTokenCountAsync;
+        if (typeof fn === 'function') {
+            try {
+                const count = await fn(text);
+                if (Number.isFinite(count) && count >= 0) return count;
+            } catch {
+                /* Fall back to local estimate when host tokenizer fails. */
+            }
+        }
+        return estimateTokenCount(text);
+    }
     async function uploadRoleImage(blob, fileName, extension) {
         if (
             typeof roleImageStorage?.getBase64Async !== 'function' ||
@@ -158,6 +172,10 @@ export function createSillyTavernHost({
         )
             throw new Error('任务对应的回复楼层已变化，请先核对聊天');
         const swipes = reply?.swipes || (reply ? [reply.mes] : []);
+        const needTokens = (validationOptions?.minTokens || 0) > 0;
+        const swipeTokens = needTokens ? await Promise.all(swipes.map((text) => countTokens(text))) : null;
+        const optionsForSwipe = (swipe) =>
+            needTokens ? { ...validationOptions, tokenCount: swipeTokens[swipe] } : validationOptions;
         let changed = false;
         const updates = [];
         for (const item of [...batch.items, ...(batch.history || [])]) {
@@ -177,7 +195,7 @@ export function createSillyTavernHost({
                 if (explicitlyRequeued && (!pendingAttempt || receipt?.attemptId !== pendingAttempt)) return false;
                 if (receipt?.taskId !== batch.id || receipt.itemId !== item.id || receipt.previewId) return false;
                 if (!text?.trim() || text.trim() === '...') return false;
-                if (receipt.origin !== 'worldbook' && isRoleCardTruncated(text, validationOptions)) return false;
+                if (receipt.origin !== 'worldbook' && isRoleCardTruncated(text, optionsForSwipe(swipe))) return false;
                 if (receipt.status === 'complete' || receipt.status === 'invalid') return true;
                 return receipt.status === 'partial' && endsWithClosingMarker(text);
             };
@@ -229,7 +247,7 @@ export function createSillyTavernHost({
                 !item.failed &&
                 Number.isInteger(item.swipe) &&
                 swipes[item.swipe]?.trim() &&
-                !isRoleCardTruncated(swipes[item.swipe], validationOptions)
+                !isRoleCardTruncated(swipes[item.swipe], optionsForSwipe(item.swipe))
             ) {
                 index = item.swipe;
                 reply.swipe_info ??= [];
@@ -315,9 +333,11 @@ export function createSillyTavernHost({
             const text = String(swipes[swipe] || '');
             const receipt = reply.swipe_info?.[swipe]?.extra?.nag_role_batch;
             const empty = !text.trim() || text.trim() === '...';
+            const tokenCount = !empty && (validationOptions?.minTokens || 0) > 0 ? await countTokens(text) : null;
+            const checkOptions = tokenCount != null ? { ...validationOptions, tokenCount } : validationOptions;
             const truncated =
                 empty ||
-                (receipt?.origin !== 'worldbook' && isRoleCardTruncated(text, validationOptions)) ||
+                (receipt?.origin !== 'worldbook' && isRoleCardTruncated(text, checkOptions)) ||
                 (receipt?.status === 'partial' && !endsWithClosingMarker(text));
             if (truncated) {
                 if (receipt && receipt.status === 'complete') {
@@ -339,7 +359,7 @@ export function createSillyTavernHost({
                 }
                 changed = true;
             }
-            results.push({ item, swipe, text, truncated });
+            results.push({ item, swipe, text, truncated, tokenCount });
         }
         if (changed) await getContext().saveChat();
         return results;
@@ -912,11 +932,18 @@ export function createSillyTavernHost({
             if (failure || floor !== (batch.resultFloor ?? batch.promptFloor + 1)) return;
             const processor = getContext()?.streamingProcessor;
             const text = String(messages[floor]?.mes || '');
-            if (text.trim() && text.trim() !== '...' && (!processor || (processor.isFinished && !processor.isStopped)))
+            if (
+                text.trim() &&
+                text.trim() !== '...' &&
+                (!processor || (processor.isFinished && !processor.isStopped))
+            ) {
+                const tokenCount = (validationOptions?.minTokens || 0) > 0 ? await countTokens(text) : null;
+                const checkOptions = tokenCount != null ? { ...validationOptions, tokenCount } : validationOptions;
                 markReceipt(
-                    isRoleCardTruncated(text, validationOptions) ? 'invalid' : 'complete',
+                    isRoleCardTruncated(text, checkOptions) ? 'invalid' : 'complete',
                     roleIsolation?.active() ? await hashRoleResult(text) : undefined,
                 );
+            }
         };
         if (stopEvent) context.eventSource?.on(stopEvent, onUserStop);
         if (startEvent) context.eventSource?.on(startEvent, onStarted);
@@ -1005,12 +1032,14 @@ export function createSillyTavernHost({
             }
             const processor = getContext()?.streamingProcessor;
             const isStreamInterrupted = Boolean(processor && (!processor.isFinished || processor.isStopped));
+            const tokenCount = (validationOptions?.minTokens || 0) > 0 ? await countTokens(text) : null;
+            const checkOptions = tokenCount != null ? { ...validationOptions, tokenCount } : validationOptions;
             markReceipt(
-                isStreamInterrupted ? 'partial' : isRoleCardTruncated(text, validationOptions) ? 'invalid' : 'complete',
+                isStreamInterrupted ? 'partial' : isRoleCardTruncated(text, checkOptions) ? 'invalid' : 'complete',
                 roleIsolation?.active() ? await hashRoleResult(text) : undefined,
             );
             await context.saveChat();
-            return { text, swipe: reply.swipe_id, truncated: isStreamInterrupted };
+            return { text, swipe: reply.swipe_id, truncated: isStreamInterrupted, tokenCount };
         } catch (error) {
             if (failure) throw failure;
             if (batch.resultFloor == null && messages.length === batch.promptFloor + 2 && !messages.at(-1)?.is_user)
