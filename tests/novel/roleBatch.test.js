@@ -610,19 +610,25 @@ it('skips an empty reply, continues, and retries the failed role on the next run
     expect(settings.roleBatch.items[0]).toMatchObject({
         name: '琴',
         failed: true,
+        parked: true,
         processing: false,
         error: '没有返回内容',
     });
     expect(settings.roleBatch.items[1]).toMatchObject({ name: '安柏', processed: true, failed: false });
-    expect(notify).toHaveBeenCalledWith('warning', expect.stringContaining('仍有 1 项未完成'));
+    expect(notify).toHaveBeenCalledWith('warning', expect.stringContaining('有 1 个失败角色已移至「暂移角色」'));
     expect(settings.isRunning).toBe(false);
     expect(host.restoreRoleTemplate).toHaveBeenCalledWith(settings.roleBatch);
+    expect(runner.restoreAllParked()).toBe(1);
     const retry = runner.start();
     await vi.runAllTimersAsync();
     await retry;
     expect(host.generateRoleReply).toHaveBeenCalledTimes(3);
     expect(host.generateRoleReply.mock.calls[2][1]).toContain('琴');
-    expect(settings.roleBatch.items[0]).toMatchObject({ failed: false, error: null });
+    expect(settings.roleBatch.items.find((item) => item.name === '琴')).toMatchObject({
+        failed: false,
+        parked: false,
+        error: null,
+    });
 });
 
 it('marks explicit truncation and continues without retrying that character', async () => {
@@ -856,6 +862,7 @@ it('auditReplies marks falsely completed truncated replies as failed, removes th
     });
     expect(settings.roleBatch.items[0]).toMatchObject({
         failed: true,
+        parked: true,
         error: '角色卡未闭合或内容截断',
         nameWarning: null,
     });
@@ -868,6 +875,34 @@ it('auditReplies marks falsely completed truncated replies as failed, removes th
         nameWarning: null,
     });
     expect(settings.roleArchive).toEqual(['安柏', '芭芭拉']);
-    expect(settings.roleBatch.index).toBe(0);
-    expect(notify).toHaveBeenCalledWith('warning', expect.stringContaining('1 页截断已标失败'));
+    expect(settings.roleBatch.index).toBe(3);
+    expect(notify).toHaveBeenCalledWith('warning', expect.stringContaining('1 页截断已标失败并移至暂移区'));
+    expect(runner.restoreAllParked()).toBe(1);
+    expect(settings.roleBatch.items.at(-1)).toMatchObject({ name: '琴', failed: true, parked: false });
+    expect(settings.roleBatch.index).toBe(2);
+});
+
+it('restoreAllParked moves multiple failed and manually parked roles to the tail safely', async () => {
+    vi.useFakeTimers();
+    const { settings, host, runner } = setup([
+        { text: '' },
+        { text: '完成B' },
+        { text: '<character_design_complex>\nname: 丽莎' },
+        { text: '补齐A' },
+        { text: '补齐C' },
+    ]);
+    settings.roleNames = '琴\n安柏\n丽莎';
+    const first = runner.start();
+    await vi.runAllTimersAsync();
+    await first;
+    // 琴（空回复失败）和丽莎（未闭合截断失败）均自动进入暂移区
+    expect(settings.roleBatch.items.filter((item) => item.parked).map((item) => item.name)).toEqual(['琴', '丽莎']);
+    // 全部放回队列后，再次开始只集中补齐这两个失败角色
+    expect(runner.restoreAllParked()).toBe(2);
+    expect(settings.roleBatch.items.map((item) => item.name)).toEqual(['安柏', '琴', '丽莎']);
+    const second = runner.start();
+    await vi.runAllTimersAsync();
+    await second;
+    expect(host.generateRoleReply).toHaveBeenCalledTimes(5);
+    expect(settings.roleBatch.items.every((item) => item.processed && !item.failed && !item.parked)).toBe(true);
 });

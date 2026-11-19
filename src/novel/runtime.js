@@ -110,7 +110,7 @@ export function initNovelUI(host) {
     let archiveMatcherCache = null;
     let renderedArchiveKey = null;
     let progressCountCache = null;
-    const pluginVersion = '2.0.4';
+    const pluginVersion = '2.0.5';
     function invalidateRoleArchive() {
         archiveRevision++;
         archiveMatcherCache = null;
@@ -1423,12 +1423,17 @@ export function initNovelUI(host) {
         const visibleIndices = roleNames.map((_, index) => index).filter((index) => !batch?.items[index]?.parked);
         const parked = (batch?.items || []).filter((item) => item.parked);
         $('#nag-parked-count').text(`（${parked.length}）`);
+        $('#nag-parked-restore-all').prop('disabled', !parked.length || fileOperation);
+        $('#nag-parked-copy').prop('disabled', !parked.length);
         $('#nag-parked-list').html(
             parked
-                .map(
-                    (item) =>
-                        `<div class="nag-role-status-row"><span>${escapeHtml(item.name)}</span><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="restore">放回队列</button></div>`,
-                )
+                .map((item) => {
+                    const icon = item.failed ? '❌' : '⏸';
+                    const reason = item.error
+                        ? ` <span class="nag-role-failure" data-id="${escapeAttribute(item.id)}" title="${escapeAttribute(item.error)}">⚠</span>`
+                        : '';
+                    return `<div class="nag-role-status-row"><span>${icon} ${escapeHtml(item.name)}${reason}</span><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="restore">放回队列</button></div>`;
+                })
                 .join('') || '<small class="nag-hint">没有暂移角色</small>',
         );
         roleRowsPage = Math.min(roleRowsPage, Math.max(0, Math.ceil(visibleIndices.length / ROLE_ROWS_PAGE) - 1));
@@ -1635,7 +1640,7 @@ export function initNovelUI(host) {
                         <small id="nag-role-correction-hint" class="nag-hint" style="display:none">只修改名单状态，不删除回复。标记失败后可继续生成；标记完成不会创建正文，没有正文时无法导出该角色。</small>
                         <div id="nag-role-results" class="ttw-memory-queue" style="display:none"></div>
                         <div class="nag-btn-row"><input id="nag-queue-add-name" class="text_pole" placeholder="输入角色名"><button type="button" id="nag-queue-add" class="menu_button">加入队尾</button></div>
-                        <details id="nag-parked"><summary>暂移角色<span id="nag-parked-count"></span></summary><div id="nag-parked-list" class="ttw-memory-queue"></div></details>
+                        <details id="nag-parked"><summary>暂移角色<span id="nag-parked-count"></span></summary><div class="nag-btn-row"><button type="button" id="nag-parked-restore-all" class="menu_button">全部放回队列</button><button type="button" id="nag-parked-copy" class="menu_button">复制名单</button></div><div id="nag-parked-list" class="ttw-memory-queue"></div></details>
                         <div id="nag-role-rows-pager" class="nag-btn-row" style="display:none"><button type="button" id="nag-role-rows-prev" class="menu_button">上一页</button><small id="nag-role-rows-page" class="nag-hint" aria-live="polite"></small><button type="button" id="nag-role-rows-jump" class="menu_button">跳到当前</button><button type="button" id="nag-role-rows-more" class="menu_button">下一页</button></div>
                     </div>
                 </div>
@@ -1923,9 +1928,50 @@ export function initNovelUI(host) {
             updateUI();
             $('#nag-archive-list').scrollTop(0);
         });
-        $('#nag-role-results').on('click', '.nag-role-failure', function () {
-            const item = settings.roleBatch?.items?.[Number(this.dataset.index)];
+        $('#nag-role-results, #nag-parked-list').on('click', '.nag-role-failure', function () {
+            const items = settings.roleBatch?.items || [];
+            const item = this.dataset.id
+                ? items.find((entry) => entry.id === this.dataset.id)
+                : items[Number(this.dataset.index)];
             toastr.warning(item?.error || item?.nameWarning || '这一项没有记录失败原因', undefined, { timeOut: 8000 });
+        });
+        $('#nag-parked-restore-all').on('click', () => {
+            if (fileOperation) return;
+            try {
+                const count = roleRunner.restoreAllParked();
+                if (!count) return toastr.info('暂移区为空');
+                $('#nag-set-prompt').val(settings.roleNames);
+                saveSettings();
+                updateUI();
+                toastr.success(
+                    settings.isRunning
+                        ? `已将 ${count} 个角色放回队尾`
+                        : `已将 ${count} 个角色放回队列，点击「开始／继续」即可集中生成`,
+                );
+            } catch (error) {
+                toastr.warning(error.message);
+            }
+        });
+        $('#nag-parked-copy').on('click', async () => {
+            const names = (settings.roleBatch?.items || []).filter((item) => item.parked).map((item) => item.name);
+            if (!names.length) return toastr.info('暂移区为空');
+            const text = names.join('\n');
+            try {
+                if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+                else {
+                    const area = document.createElement('textarea');
+                    area.value = text;
+                    area.style.position = 'fixed';
+                    area.style.opacity = '0';
+                    document.body.appendChild(area);
+                    area.select();
+                    document.execCommand('copy');
+                    area.remove();
+                }
+                toastr.success(`已复制 ${names.length} 个暂移角色名`);
+            } catch {
+                toastr.warning('复制失败，请检查浏览器剪贴板权限');
+            }
         });
         $('#nag-btn-audit-replies').on('click', async () => {
             if (settings.isRunning || fileOperation) return;
