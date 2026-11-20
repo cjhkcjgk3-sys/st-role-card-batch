@@ -86,6 +86,7 @@ export function createRoleSelectionUI({
     isBusy,
     onReroll,
     onPreview = {},
+    onRefresh = null,
     notify = () => {},
 }) {
     const context = host.getContext();
@@ -138,6 +139,7 @@ export function createRoleSelectionUI({
         if (pendingPreview) renderPreviewButtons(floor, previewState);
         if (!selected && !canReroll) {
             clearPrompt();
+            onRefresh?.();
             return;
         }
         const promptFloor = sameBatch && Number.isInteger(batch.promptFloor) ? batch.promptFloor : floor - 1;
@@ -177,9 +179,15 @@ export function createRoleSelectionUI({
                 }
             }
         } else if (!isBusy()) clearPrompt();
-        if (!canReroll) return;
+        if (!canReroll) {
+            onRefresh?.();
+            return;
+        }
         const container = document.querySelector(`#chat .mes[mesid="${floor}"] .mes_buttons`);
-        if (!container) return;
+        if (!container) {
+            onRefresh?.();
+            return;
+        }
         let button = container.querySelector('.nag-reroll-role');
         if (!button) {
             button = document.createElement('button');
@@ -194,6 +202,7 @@ export function createRoleSelectionUI({
         button.textContent = '↻ 重生成此角色';
         button.title = selected?.item?.name ? `重新生成 ${selected.item.name}` : '重新生成当前备选页（点击输入角色名）';
         button.disabled = isBusy();
+        onRefresh?.();
     }
     function renderPreviewButtons(floor, { preview, candidates, onCandidate }) {
         const document = globalThis.document;

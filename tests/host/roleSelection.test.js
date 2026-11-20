@@ -128,3 +128,28 @@ it('resolveRerollTarget still resolves stopped, unbound, or truncated pages with
         bound: false,
     });
 });
+
+it('invokes onRefresh when chat events fire so bottom chat bar stays synchronized', async () => {
+    const { EventEmitter } = await import('node:events');
+    const { createRoleSelectionUI } = await import('../../src/host/roleSelection.js');
+    const { vi } = await import('vitest');
+    globalThis.document ??= { querySelectorAll: () => [], querySelector: () => null };
+    const source = new EventEmitter();
+    const context = {
+        eventSource: source,
+        eventTypes: { CHAT_CHANGED: 'cc', MESSAGE_RECEIVED: 'mr' },
+        updateMessageBlock: () => {},
+    };
+    const onRefresh = vi.fn();
+    const ui = createRoleSelectionUI({
+        host: { getContext: () => context, getChat: () => [], snapshot: () => ({ identity: 'c1' }) },
+        getBatch: () => null,
+        isBusy: () => false,
+        onReroll: () => {},
+        onRefresh,
+    });
+    source.emit('cc');
+    source.emit('mr');
+    expect(onRefresh).toHaveBeenCalledTimes(2);
+    ui.dispose();
+});

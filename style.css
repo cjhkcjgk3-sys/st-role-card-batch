@@ -811,6 +811,36 @@
     font-weight: 600;
 }
 
+/* 聊天楼层底栏（挂在 #send_form 内、与酒馆快速回复栏 #qr--bar 同区域，独立不被 QR 重绘清除） */
+#nag-chat-bar {
+    order: 2;
+    width: 100%;
+    max-width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 4px 6px 2px;
+    box-sizing: border-box;
+}
+
+#nag-chat-bar[hidden] {
+    display: none;
+}
+
+#nag-chat-bar .menu_button {
+    width: auto;
+    max-width: 100%;
+    margin: 0;
+    padding: 4px 10px;
+    font-size: 13px;
+    line-height: 1.35;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .nag-role-image-slot {
     display: inline-flex;
     flex: 0 0 auto;

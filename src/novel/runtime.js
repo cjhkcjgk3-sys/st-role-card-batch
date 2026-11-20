@@ -117,7 +117,7 @@ export function initNovelUI(host) {
     let progressCountCache = null;
     let duplicateNamesCache = null;
     let unknownPagesCache = null;
-    const pluginVersion = '2.1.0';
+    const pluginVersion = '2.1.1';
     function invalidateRoleArchive() {
         archiveRevision++;
         archiveMatcherCache = null;
@@ -1315,6 +1315,102 @@ export function initNovelUI(host) {
         }
     }
 
+    /** 查找下一个在手动模式下将要生成的角色名（跳过已完成、名录与暂移项）。 */
+    function nextManualRoleName() {
+        const batch = settings.roleBatch;
+        const names = batch?.names || parseRoleNames(settings.roleNames);
+        if (!names.length) return null;
+        const archiveNames = Array.isArray(settings.roleArchive) ? settings.roleArchive : [];
+        const matcher = getArchiveMatcher(archiveNames, settings.roleImageLibrary?.workNames);
+        for (let index = 0; index < names.length; index++) {
+            const item = batch?.items?.[index];
+            if (item?.parked) continue;
+            if (!resolveRoleStatus(item, matcher.has(names[index])).complete) return names[index];
+        }
+        return null;
+    }
+
+    /** 检查当前聊天是否应显示聊天底栏的手动「生成下一个」按钮。 */
+    function isWriteCardChat() {
+        const identity = host.snapshot().identity;
+        if (identity == null) return false;
+        const batch = settings.roleBatch;
+        if (batch && batch.identity === identity) return true;
+        const names = parseRoleNames(settings.roleNames);
+        if (!names.length) return false;
+        const chat = host.getChat();
+        if (!Array.isArray(chat) || !chat.length) return false;
+        for (let index = chat.length - 1; index >= 0; index--) {
+            const message = chat[index];
+            if (message?.is_user) return typeof message.mes === 'string' && message.mes.includes('[[角色名]]');
+        }
+        return false;
+    }
+
+    function ensureChatManualBar() {
+        const sendForm = document.getElementById('send_form');
+        if (!sendForm) return null;
+        let bar = document.getElementById('nag-chat-bar');
+        if (!bar) {
+            bar = document.createElement('div');
+            bar.id = 'nag-chat-bar';
+            bar.className = 'flex-container flexGap5';
+            bar.hidden = true;
+            bar.innerHTML =
+                '<button type="button" id="nag-chat-next" class="menu_button">▶️ 生成下一个</button>' +
+                '<button type="button" id="nag-chat-stop" class="menu_button" hidden>⏹️ 停止</button>';
+            const nextBtn = bar.querySelector('#nag-chat-next');
+            const stopBtn = bar.querySelector('#nag-chat-stop');
+            nextBtn?.addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                void startGeneration();
+            });
+            stopBtn?.addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                stopGeneration();
+            });
+        }
+        if (bar.parentElement !== sendForm) {
+            const nonQr = sendForm.querySelector('#nonQRFormItems');
+            if (nonQr) sendForm.insertBefore(bar, nonQr);
+            else sendForm.appendChild(bar);
+        }
+        return bar;
+    }
+
+    function syncChatManualBar() {
+        if (disposed) return;
+        const bar = ensureChatManualBar();
+        if (!bar) return;
+        const show = Boolean(settings.manualMode) && settings.generationMode === 'role-batch' && isWriteCardChat();
+        bar.hidden = !show;
+        if (!show) return;
+        const busy = settings.isRunning || fileOperation;
+        const nextName = nextManualRoleName();
+        const nextBtn = bar.querySelector('#nag-chat-next');
+        const stopBtn = bar.querySelector('#nag-chat-stop');
+        if (nextBtn) {
+            if (settings.isRunning) {
+                nextBtn.textContent = '⏳ 生成中…';
+                nextBtn.disabled = true;
+            } else if (nextName) {
+                nextBtn.textContent = `▶️ 生成下一个：${nextName}`;
+                nextBtn.title = `手动生成下一个角色：${nextName}`;
+                nextBtn.disabled = busy;
+            } else {
+                nextBtn.textContent = '▶️ 生成下一个（已全部完成）';
+                nextBtn.title = '当前名单没有待生成角色';
+                nextBtn.disabled = true;
+            }
+        }
+        if (stopBtn) {
+            stopBtn.hidden = !settings.isRunning;
+            stopBtn.disabled = !settings.isRunning;
+        }
+    }
+
     function updateUI() {
         resultIsolation?.refresh();
         roleSelection?.refresh();
@@ -1551,16 +1647,18 @@ export function initNovelUI(host) {
 
         $('#nag-mode-auto').toggleClass('is-active', !manualMode).prop('disabled', busy);
         $('#nag-mode-manual').toggleClass('is-active', manualMode).prop('disabled', busy);
-        $('#nag-btn-start').prop('disabled', busy);
+        $('#nag-btn-start').toggle(!manualMode).prop('disabled', busy);
+        $('#nag-manual-bar-hint').toggle(manualMode);
         $('#nag-btn-pause')
             .toggle(!manualMode)
             .prop('disabled', !settings.isRunning || settings.isPaused);
         $('#nag-btn-resume').toggle(!manualMode).prop('disabled', !settings.isPaused);
         $('#nag-btn-stop').prop('disabled', !settings.isRunning);
         $('#nag-btn-reset').prop('disabled', busy);
-        $('#nag-btn-start').text(manualMode ? '▶️ 生成下一个' : batchMode ? '▶️ 开始／继续' : '▶️ 开始');
+        $('#nag-btn-start').text(batchMode ? '▶️ 开始／继续' : '▶️ 开始');
         $('#nag-btn-reset').text(batchMode ? '🔄 重置（保留已完成）' : '🔄 重置');
         $('#nag-btn-restart-role').toggle(batchMode).prop('disabled', busy);
+        syncChatManualBar();
 
         if (settings.isRunning && generationStats.startTime && generationStats.chaptersGenerated > 0) {
             const elapsed = Date.now() - generationStats.startTime;
@@ -1641,6 +1739,7 @@ export function initNovelUI(host) {
                         <button id="nag-btn-resume" class="menu_button" disabled>⏯️ 恢复</button>
                         <button id="nag-btn-stop" class="menu_button" disabled>⏹️ 停止</button>
                     </div>
+                    <small id="nag-manual-bar-hint" class="nag-hint" style="display:none">手动模式：「▶️ 生成下一个」位于聊天楼层底部（快速回复区域），也可在下方名单行直接点「生成」。</small>
                     <div class="nag-btn-row"><button id="nag-btn-reset" class="menu_button">🔄 重置</button><button id="nag-btn-restart-role" class="menu_button" style="display:none">从头生成</button></div>
                     <div class="nag-checkbox-group"><label class="nag-checkbox-label"><input type="checkbox" id="nag-set-buffer-stream"><span>任务流式回复由服务端暂存</span></label></div>
                     <small class="nag-hint">需要安装服务器缓冲组件。页面恢复后继续接收；服务或模型断开仍可能中断。</small>
@@ -2610,6 +2709,7 @@ export function initNovelUI(host) {
             getWorkNames: () => settings.roleImageLibrary?.workNames || [],
             isBusy: () => settings.isRunning || fileOperation,
             onReroll: rerollCurrentRole,
+            onRefresh: syncChatManualBar,
             onPreview: {
                 compare: () =>
                     runRoleAction(async () => {
@@ -2774,6 +2874,7 @@ export function initNovelUI(host) {
             resultIsolation?.dispose();
             roleSelection?.dispose();
             bufferedStream.dispose();
+            $('#nag-chat-bar').remove();
             $('#nag-container').remove();
             if (window.nagDebug === debugRawContent) delete window.nagDebug;
             instance = null;
