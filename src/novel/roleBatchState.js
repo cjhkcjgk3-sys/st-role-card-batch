@@ -240,6 +240,7 @@ export function applyRoleArchiveChanges(batch, previousArchive, nextArchive, wor
                               archived: true,
                               processed: true,
                               failed: false,
+                              parked: false,
                               processing: false,
                               manualStatus: null,
                               error: null,
@@ -287,6 +288,7 @@ export function applyRoleArchiveChanges(batch, previousArchive, nextArchive, wor
                 archived: true,
                 processed: true,
                 failed: false,
+                parked: false,
                 processing: false,
                 manualStatus: null,
                 error: null,
@@ -433,4 +435,85 @@ export function matchRoleCardToCandidates(candidates, text, workNames = []) {
         const itemMatcher = createRoleNameMatcher([name], workNames);
         return allNames.some((candidate) => itemMatcher.has(candidate));
     });
+}
+
+/** 规范化全局跨对话「暂移角色」列表：按去首尾空格的精确角色名去重，保留失败标记与原因。 */
+export function normalizeRoleParked(list) {
+    const entries = [];
+    const seen = new Set();
+    for (const raw of Array.isArray(list) ? list : []) {
+        const isObject = raw && typeof raw === 'object';
+        const name = String((isObject ? raw.name : raw) || '').trim();
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+        const failed = Boolean(isObject && raw.failed);
+        const error = isObject && raw.error ? String(raw.error) : null;
+        entries.push({ name, failed, error });
+    }
+    return entries;
+}
+
+export function findRoleParked(list, name) {
+    const target = String(name || '').trim();
+    if (!target) return null;
+    return normalizeRoleParked(list).find((entry) => entry.name === target) || null;
+}
+
+export function upsertRoleParked(list, entry) {
+    const normalized = normalizeRoleParked(list);
+    const isObject = entry && typeof entry === 'object';
+    const name = String((isObject ? entry.name : entry) || '').trim();
+    if (!name) return normalized;
+    const failed = Boolean(isObject && entry.failed);
+    const error = isObject && entry.error ? String(entry.error) : null;
+    const existingIndex = normalized.findIndex((item) => item.name === name);
+    if (existingIndex >= 0) {
+        normalized[existingIndex] = { name, failed, error };
+        return normalized;
+    }
+    return [...normalized, { name, failed, error }];
+}
+
+export function removeRoleParked(list, names) {
+    const normalized = normalizeRoleParked(list);
+    const targets = new Set(
+        (Array.isArray(names) ? names : [names]).map((value) => String(value || '').trim()).filter(Boolean),
+    );
+    if (!targets.size) return normalized;
+    return normalized.filter((entry) => !targets.has(entry.name));
+}
+
+/** 将全局暂移列表同步到批次条目（不覆盖已完成项，不抹除已有手动/失败暂移信息）。 */
+export function applyParkedRoles(batch, roleParked) {
+    if (!batch?.items) return;
+    const parkedMap = new Map(normalizeRoleParked(roleParked).map((entry) => [entry.name, entry]));
+    if (!parkedMap.size) return;
+    for (const item of batch.items) {
+        const name = String(item?.name || '').trim();
+        const entry = parkedMap.get(name);
+        if (!entry || roleComplete(item)) continue;
+        item.parked = true;
+        if (entry.failed) {
+            item.failed = true;
+            if (entry.error && !item.error) item.error = entry.error;
+        }
+    }
+    if (batch.names) batch.index = nextRoleIndex(batch);
+}
+
+/**
+ * 仅用于列表展示排序（绝不改动原始名单顺序与实际生成顺序）。
+ * mode === 'pending-first' 时，将未完成（排队/生成中/失败）置顶，已完成（含名录跳过）排到下方；
+ * 两组内部均严格保持原有相对顺序与原始编号。
+ */
+export function orderVisibleRoleIndices(visibleIndices, isCompleteAt, mode = 'original') {
+    if (!Array.isArray(visibleIndices)) return [];
+    if (mode !== 'pending-first') return [...visibleIndices];
+    const pending = [];
+    const complete = [];
+    for (const index of visibleIndices) {
+        if (isCompleteAt(index)) complete.push(index);
+        else pending.push(index);
+    }
+    return [...pending, ...complete];
 }

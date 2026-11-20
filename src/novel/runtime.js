@@ -4,11 +4,15 @@ import { createBufferedStream } from '../host/bufferedStream.js';
 import { createRoleBatchRecoveryStore } from './recoveryStore.js';
 import {
     applyArchiveSkips,
+    applyParkedRoles,
     countUnidentifiedRolePages,
     duplicateRoleNames,
     dedupeRoleArchive,
+    findRoleParked,
     mergeRoleArchive,
     normalizeRoleArchive,
+    normalizeRoleParked,
+    orderVisibleRoleIndices,
     removeRoleArchiveName,
     roleComplete,
     resolveRoleStatus,
@@ -54,6 +58,10 @@ export function initNovelUI(host) {
         roleImageLibrary: null,
         // 已完成角色名录（全局共用）：生成名单里出现这个名字时自动跳过，避免重复生成。
         roleArchive: [],
+        // 暂移角色列表（全局跨对话持久化）：手动暂移与失败/截断暂移均跨对话保留，直到放回队列或生成完成。
+        roleParked: [],
+        // 生成状态列表显示排序（仅展示排序，不改变实际名单与生成顺序）：'original' | 'pending-first'
+        roleListSort: 'original',
         errorLog: [],
         isRunning: false,
         isPaused: false,
@@ -120,7 +128,7 @@ export function initNovelUI(host) {
     let duplicateNamesCache = null;
     let unknownPagesCache = null;
     let lastUiIdentity = null;
-    const pluginVersion = '2.2.0';
+    const pluginVersion = '2.3.0';
     function invalidateRoleArchive() {
         archiveRevision++;
         archiveMatcherCache = null;
@@ -1171,9 +1179,11 @@ export function initNovelUI(host) {
         // 本插件只做角色卡批量生成：忽略历史设置里的小说模式
         settings.generationMode = 'role-batch';
         const savedSettings = host.readSettings(extensionName);
+        const hadRoleParked = Object.hasOwn(savedSettings, 'roleParked');
         if (!Object.hasOwn(savedSettings, 'isolateRoleResult'))
             settings.isolateRoleResult = !!savedSettings.hideHistoryFromModel;
         delete settings.hideHistoryFromModel;
+        settings.roleListSort = settings.roleListSort === 'pending-first' ? 'pending-first' : 'original';
         void host
             .restoreLegacyVisibility()
             .catch((error) => recordError(error, { phase: 'restore-legacy-visibility' }));
@@ -1184,6 +1194,8 @@ export function initNovelUI(host) {
         settings.isPaused = false;
         try {
             roleRunner.restore();
+            if (!hadRoleParked) roleRunner.migrateParkedFromBatches();
+            else settings.roleParked = normalizeRoleParked(settings.roleParked);
             saveSettings();
         } catch (error) {
             recordError(error, { phase: 'load-recovery' });
@@ -1323,17 +1335,87 @@ export function initNovelUI(host) {
         }
     }
 
-    /** 查找下一个在手动模式下将要生成的角色名（跳过已完成、名录与暂移项）。 */
+    /** 合并当前批次与全局 settings.roleParked 的暂移列表，保证切到新对话未开跑前也能看到并操作全部暂移角色。 */
+    function getVisibleParkedEntries(batch = currentChatBatch()) {
+        const entries = [];
+        const seen = new Set();
+        const batchByName = new Map();
+        for (const item of batch?.items || []) {
+            if (item?.name) batchByName.set(item.name, item);
+            if (!item?.parked || !item.name || seen.has(item.name)) continue;
+            seen.add(item.name);
+            entries.push({
+                id: item.id || '',
+                name: item.name,
+                failed: Boolean(item.failed),
+                error: item.error || null,
+            });
+        }
+        for (const entry of normalizeRoleParked(settings.roleParked)) {
+            if (seen.has(entry.name)) continue;
+            const batchItem = batchByName.get(entry.name);
+            if (batchItem && (batchItem.parked === false || roleComplete(batchItem))) continue;
+            seen.add(entry.name);
+            entries.push({
+                id: batchItem?.id || '',
+                name: entry.name,
+                failed: Boolean(batchItem?.failed || entry.failed),
+                error: batchItem?.error || entry.error || null,
+            });
+        }
+        return entries;
+    }
+
+    function buildParkedNameSet(batch = currentChatBatch()) {
+        const set = new Set(normalizeRoleParked(settings.roleParked).map((entry) => entry.name));
+        for (const item of batch?.items || []) {
+            if (item?.parked && item.name) set.add(item.name);
+        }
+        return set;
+    }
+
+    function isRoleIndexParked(batch, parkedNames, index, name) {
+        const item = batch?.items?.[index];
+        if (item && typeof item.parked === 'boolean') return item.parked;
+        return parkedNames.has(name);
+    }
+
+    function roleSortMode() {
+        return settings.roleListSort === 'pending-first' ? 'pending-first' : 'original';
+    }
+
+    function computeRoleDisplayOrder(batch, roleNames, archiveNameMatcher, parkedNames) {
+        const visibleIndices = roleNames
+            .map((_, index) => index)
+            .filter((index) => !isRoleIndexParked(batch, parkedNames, index, roleNames[index]));
+        const displayIndices = orderVisibleRoleIndices(
+            visibleIndices,
+            (index) => resolveRoleStatus(batch?.items?.[index], archiveNameMatcher.has(roleNames[index])).complete,
+            roleSortMode(),
+        );
+        return { visibleIndices, displayIndices };
+    }
+
+    function currentDisplayPosition(visibleIndices, displayIndices, batchIndex) {
+        if (!displayIndices.length) return { position: 0, targetIndex: 0 };
+        const fallbackIndex = visibleIndices.find((index) => index >= batchIndex) ?? visibleIndices[0];
+        const position = Math.max(0, displayIndices.indexOf(fallbackIndex));
+        return { position, targetIndex: fallbackIndex };
+    }
+
+    /** 查找下一个在手动模式下将要生成的角色名（跳过已完成、名录与全局/当前批次暂移项）。 */
     function nextManualRoleName() {
         const batch = currentChatBatch();
         const names = batch?.names || parseRoleNames(settings.roleNames);
         if (!names.length) return null;
+        const parkedNames = buildParkedNameSet(batch);
         const archiveNames = Array.isArray(settings.roleArchive) ? settings.roleArchive : [];
         const matcher = getArchiveMatcher(archiveNames, settings.roleImageLibrary?.workNames);
         for (let index = 0; index < names.length; index++) {
+            const name = names[index];
             const item = batch?.items?.[index];
-            if (item?.parked) continue;
-            if (!resolveRoleStatus(item, matcher.has(names[index])).complete) return names[index];
+            if (isRoleIndexParked(batch, parkedNames, index, name)) continue;
+            if (!resolveRoleStatus(item, matcher.has(name)).complete) return name;
         }
         return null;
     }
@@ -1366,13 +1448,31 @@ export function initNovelUI(host) {
             bar.hidden = true;
             bar.innerHTML =
                 '<button type="button" id="nag-chat-next" class="menu_button">▶️ 生成下一个</button>' +
+                '<button type="button" id="nag-chat-park" class="menu_button" hidden>⏸ 暂移</button>' +
                 '<button type="button" id="nag-chat-stop" class="menu_button" hidden>⏹️ 停止</button>';
             const nextBtn = bar.querySelector('#nag-chat-next');
+            const parkBtn = bar.querySelector('#nag-chat-park');
             const stopBtn = bar.querySelector('#nag-chat-stop');
             nextBtn?.addEventListener('click', (event) => {
                 event.preventDefault();
                 event.stopPropagation();
                 void startGeneration();
+            });
+            parkBtn?.addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (settings.isRunning || fileOperation) return;
+                const targetName = nextManualRoleName();
+                if (!targetName) return;
+                try {
+                    roleRunner.parkRole(targetName);
+                    $('#nag-set-prompt').val(settings.roleNames);
+                    saveSettings();
+                    updateUI();
+                    toastr.info(`已将「${targetName}」移至暂移区`);
+                } catch (error) {
+                    toastr.warning(error.message);
+                }
             });
             stopBtn?.addEventListener('click', (event) => {
                 event.preventDefault();
@@ -1398,6 +1498,7 @@ export function initNovelUI(host) {
         const busy = settings.isRunning || fileOperation;
         const nextName = nextManualRoleName();
         const nextBtn = bar.querySelector('#nag-chat-next');
+        const parkBtn = bar.querySelector('#nag-chat-park');
         const stopBtn = bar.querySelector('#nag-chat-stop');
         if (nextBtn) {
             if (settings.isRunning) {
@@ -1412,6 +1513,12 @@ export function initNovelUI(host) {
                 nextBtn.title = '当前名单没有待生成角色';
                 nextBtn.disabled = true;
             }
+        }
+        if (parkBtn) {
+            const showPark = !settings.isRunning && Boolean(nextName);
+            parkBtn.hidden = !showPark;
+            parkBtn.disabled = !showPark || busy;
+            parkBtn.title = nextName ? `将「${nextName}」移至暂移区并跳到下一个` : '';
         }
         if (stopBtn) {
             stopBtn.hidden = !settings.isRunning;
@@ -1433,6 +1540,7 @@ export function initNovelUI(host) {
                 batch.names.some((name, index) => name !== parsed[index]);
             if (namesChanged) {
                 updateRoleNames(batch, parsed);
+                applyParkedRoles(batch, settings.roleParked);
                 applyArchiveSkips(batch, settings.roleArchive, settings.roleImageLibrary?.workNames);
                 batch.inputNames = settings.roleNames;
                 batch.inputLimit = settings.totalChapters;
@@ -1454,9 +1562,11 @@ export function initNovelUI(host) {
         if (batchMode) renderChecklistPicker();
         const archiveNames = Array.isArray(settings.roleArchive) ? settings.roleArchive : [];
         const archiveNameMatcher = getArchiveMatcher(archiveNames, imageLibrary?.workNames);
-        const total = batchMode
-            ? roleNames.length - (batch?.items || []).filter((item) => item.parked).length
-            : settings.totalChapters;
+        const parkedNames = batchMode ? buildParkedNameSet(batch) : new Set();
+        const parkedInRosterCount = batchMode
+            ? roleNames.filter((name, index) => isRoleIndexParked(batch, parkedNames, index, name)).length
+            : 0;
+        const total = batchMode ? Math.max(0, roleNames.length - parkedInRosterCount) : settings.totalChapters;
         let completed = batchMode ? 0 : settings.currentChapter;
         if (batchMode) {
             const cached = progressCountCache;
@@ -1466,14 +1576,17 @@ export function initNovelUI(host) {
                 cached.revision === batch?.revision &&
                 cached.items === batch?.items &&
                 cached.names === roleNames &&
-                cached.archiveRevision === archiveRevision
+                cached.archiveRevision === archiveRevision &&
+                cached.parkedInRosterCount === parkedInRosterCount
             ) {
                 completed = cached.completed;
             } else {
                 completed = 0;
                 for (let index = 0; index < roleNames.length; index++) {
+                    const name = roleNames[index];
+                    if (isRoleIndexParked(batch, parkedNames, index, name)) continue;
                     const item = batch?.items?.[index];
-                    if (resolveRoleStatus(item, archiveNameMatcher.has(roleNames[index])).complete) completed++;
+                    if (resolveRoleStatus(item, archiveNameMatcher.has(name)).complete) completed++;
                 }
                 progressCountCache = {
                     batch,
@@ -1481,6 +1594,7 @@ export function initNovelUI(host) {
                     items: batch?.items,
                     names: roleNames,
                     archiveRevision,
+                    parkedInRosterCount,
                     completed,
                 };
             }
@@ -1538,6 +1652,17 @@ export function initNovelUI(host) {
                     ? `有 ${unknownPages} 条备选回复缺少可核对的当前批次角色记录，无法自动判断是否同名；请先人工核对。`
                     : '',
             );
+        const sortMode = roleSortMode();
+        $('#nag-role-sort-toggle')
+            .toggle(batchMode && roleNames.length > 0)
+            .toggleClass('is-active', sortMode === 'pending-first')
+            .text(sortMode === 'pending-first' ? '排序：待生成置顶' : '排序：原顺序')
+            .attr(
+                'title',
+                sortMode === 'pending-first'
+                    ? '当前将待生成/失败角色显示在上方，已完成排在下方（仅显示排序，点击切回原顺序）'
+                    : '当前按原名单顺序显示（仅显示排序，点击切换为待生成置顶）',
+            );
         $('#nag-role-correction-toggle')
             .toggle(batchMode && !!batch)
             .prop('disabled', busy);
@@ -1562,8 +1687,10 @@ export function initNovelUI(host) {
         $('#nag-total-label').text(batchMode ? '角色总数（自动）' : '目标章节');
         $('#nag-prompt-label').text(batchMode ? '角色名单（每行一个）' : '提示词');
         $('#nag-role-results').toggle(batchMode);
-        const visibleIndices = roleNames.map((_, index) => index).filter((index) => !batch?.items[index]?.parked);
-        const parked = (batch?.items || []).filter((item) => item.parked);
+        const { visibleIndices, displayIndices } = batchMode
+            ? computeRoleDisplayOrder(batch, roleNames, archiveNameMatcher, parkedNames)
+            : { visibleIndices: [], displayIndices: [] };
+        const parked = batchMode ? getVisibleParkedEntries(batch) : [];
         const manualMode = Boolean(settings.manualMode);
         $('#nag-parked-count').text(`（${parked.length}）`);
         $('#nag-parked-restore-all').prop('disabled', !parked.length || fileOperation);
@@ -1578,20 +1705,20 @@ export function initNovelUI(host) {
                     .map((item) => {
                         const icon = item.failed ? '❌' : '⏸';
                         const reason = item.error
-                            ? ` <span class="nag-role-failure" data-id="${escapeAttribute(item.id)}" title="${escapeAttribute(item.error)}">⚠</span>`
+                            ? ` <span class="nag-role-failure" data-id="${escapeAttribute(item.id)}" data-name="${escapeAttribute(item.name)}" title="${escapeAttribute(item.error)}">⚠</span>`
                             : '';
                         const manualBtn = manualMode
                             ? `<button type="button" class="menu_button nag-manual-gen" data-id="${escapeAttribute(item.id)}" data-name="${escapeAttribute(item.name)}" title="手动单独生成 ${escapeAttribute(item.name)}"${busy ? ' disabled' : ''}>生成</button>`
                             : '';
-                        return `<div class="nag-role-status-row"><span class="nag-role-status-name">${icon} ${escapeHtml(item.name)}${reason}</span><span class="nag-role-row-controls">${manualBtn}<button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="restore-origin" title="放回原来的名单位置">原处</button><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="restore" title="放回队尾集中生成">队尾</button></span></div>`;
+                        return `<div class="nag-role-status-row"><span class="nag-role-status-name">${icon} ${escapeHtml(item.name)}${reason}</span><span class="nag-role-row-controls">${manualBtn}<button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-name="${escapeAttribute(item.name)}" data-action="restore-origin" title="放回原来的名单位置">原处</button><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-name="${escapeAttribute(item.name)}" data-action="restore" title="放回队尾集中生成">队尾</button></span></div>`;
                     })
                     .join('') || '<small class="nag-hint">没有暂移角色</small>',
             );
         }
-        roleRowsPage = Math.min(roleRowsPage, Math.max(0, Math.ceil(visibleIndices.length / ROLE_ROWS_PAGE) - 1));
+        roleRowsPage = Math.min(roleRowsPage, Math.max(0, Math.ceil(displayIndices.length / ROLE_ROWS_PAGE) - 1));
         const rowStart = roleRowsPage * ROLE_ROWS_PAGE;
         const shownRows = batchMode
-            ? visibleIndices.slice(rowStart, rowStart + ROLE_ROWS_PAGE).map((index) => {
+            ? displayIndices.slice(rowStart, rowStart + ROLE_ROWS_PAGE).map((index) => {
                   const name = roleNames[index];
                   const item = batch?.items[index] || {};
                   const suffix = item.processing ? ' 生成中' : '';
@@ -1609,9 +1736,17 @@ export function initNovelUI(host) {
                       !item.failed &&
                       !roleState.complete &&
                       (item.parked || !settings.isRunning || index >= batch.index);
+                  const parkOnlyEligible =
+                      !queueEligible &&
+                      !item.processing &&
+                      !item.parked &&
+                      !roleState.complete &&
+                      ((item.id && item.failed && !busy) || (!item.id && !busy));
                   const queueControls = queueEligible
-                      ? `<details class="nag-queue-menu"><summary>操作</summary><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="top">置顶</button><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="park">暂移</button></details><button type="button" class="menu_button nag-queue-drag" data-id="${escapeAttribute(item.id)}" aria-label="长按拖动排序">☰</button>`
-                      : '';
+                      ? `<details class="nag-queue-menu"><summary>操作</summary><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-name="${escapeAttribute(name)}" data-action="top">置顶</button><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-name="${escapeAttribute(name)}" data-action="park">暂移</button></details><button type="button" class="menu_button nag-queue-drag" data-id="${escapeAttribute(item.id)}" aria-label="长按拖动排序">☰</button>`
+                      : parkOnlyEligible
+                        ? `<button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id || '')}" data-name="${escapeAttribute(name)}" data-action="park" title="移至暂移区">暂移</button>`
+                        : '';
                   const manualBtn =
                       manualMode && !item.processing
                           ? `<button type="button" class="menu_button nag-manual-gen" data-id="${escapeAttribute(item.id || '')}" data-name="${escapeAttribute(name)}" title="手动单独生成 ${escapeAttribute(name)}"${busy ? ' disabled' : ''}>生成</button>`
@@ -1632,17 +1767,14 @@ export function initNovelUI(host) {
             : [];
         // 只计算当前页，避免隐藏行仍重复进行名称、图片匹配和 HTML 构造。
         renderRoleRows($('#nag-role-results')[0], shownRows);
-        renderPager('nag-role-rows', batchMode ? visibleIndices.length : 0, roleRowsPage);
+        renderPager('nag-role-rows', batchMode ? displayIndices.length : 0, roleRowsPage);
         {
             // 「跳到当前」只在名单跨页时出现；已经在那一页就禁用
-            const total = batchMode ? visibleIndices.length : 0;
-            const currentIndex = Math.max(
-                0,
-                visibleIndices.findIndex((index) => index >= (batch?.index ?? 0)),
-            );
+            const totalVisible = batchMode ? displayIndices.length : 0;
+            const { position } = currentDisplayPosition(visibleIndices, displayIndices, batch?.index ?? 0);
             $('#nag-role-rows-jump')
-                .prop('disabled', roleRowsPage === Math.floor(currentIndex / ROLE_ROWS_PAGE))
-                .attr('title', total ? `跳到正在生成的第 ${currentIndex + 1} 个（共 ${total} 个）` : '');
+                .prop('disabled', roleRowsPage === Math.floor(position / ROLE_ROWS_PAGE))
+                .attr('title', totalVisible ? `跳到正在生成的第 ${position + 1} 行（共 ${totalVisible} 个）` : '');
         }
         $('#nag-role-results .nag-role-status-set').prop('disabled', busy);
         syncRoleImagePreviewToggle();
@@ -1748,7 +1880,7 @@ export function initNovelUI(host) {
                         <button id="nag-btn-resume" class="menu_button" disabled>⏯️ 恢复</button>
                         <button id="nag-btn-stop" class="menu_button" disabled>⏹️ 停止</button>
                     </div>
-                    <small id="nag-manual-bar-hint" class="nag-hint" style="display:none">手动模式：「▶️ 生成下一个」位于聊天楼层底部（快速回复区域），也可在下方名单行直接点「生成」。</small>
+                    <small id="nag-manual-bar-hint" class="nag-hint" style="display:none">手动模式：「▶️ 生成下一个」与「⏸ 暂移」位于聊天楼层底部（快速回复区域），也可在下方名单行直接点「生成」。</small>
                     <div class="nag-btn-row"><button id="nag-btn-reset" class="menu_button">🔄 重置</button><button id="nag-btn-restart-role" class="menu_button" style="display:none">从头生成</button></div>
                     <div class="nag-checkbox-group"><label class="nag-checkbox-label"><input type="checkbox" id="nag-set-buffer-stream"><span>任务流式回复由服务端暂存</span></label></div>
                     <small class="nag-hint">需要安装服务器缓冲组件。页面恢复后继续接收；服务或模型断开仍可能中断。</small>
@@ -1806,6 +1938,7 @@ export function initNovelUI(host) {
                         </div>
                         <small class="nag-hint nag-result-isolation-setting">按酒馆 Token 计数检查每张角色卡；低于此值直接判截断失败并移入暂移区、不收录名录（修改后点「核对备选页」可复查已有回复）。</small>
                         <div class="nag-btn-row">
+                            <button type="button" id="nag-role-sort-toggle" class="menu_button" style="display:none">排序：原顺序</button>
                             <button type="button" id="nag-role-correction-toggle" class="menu_button" style="display:none">手动纠错</button>
                             <button type="button" id="nag-btn-audit-replies" class="menu_button" style="display:none">核对备选页</button>
                             <button type="button" id="nag-btn-restore-prompt" class="menu_button" style="display:none">恢复原始提示词</button>
@@ -2058,6 +2191,13 @@ export function initNovelUI(host) {
     }
 
     function bindEvents() {
+        $('#nag-role-sort-toggle').on('click', () => {
+            settings.roleListSort = roleSortMode() === 'pending-first' ? 'original' : 'pending-first';
+            roleRowsPage = 0;
+            saveSettings();
+            updateUI();
+            $('#nag-role-results').scrollTop(0);
+        });
         $('#nag-role-correction-toggle').on('click', () => {
             roleCorrection = !roleCorrection;
             updateUI();
@@ -2071,16 +2211,20 @@ export function initNovelUI(host) {
             const batch = currentChatBatch();
             const names = batch?.names || parseRoleNames(settings.roleNames);
             if (!names.length) return;
-            const index = Math.min(names.length - 1, Math.max(0, batch?.index ?? 0));
-            const visible = names.map((_, i) => i).filter((i) => !batch?.items[i]?.parked);
-            const position = Math.max(
-                0,
-                visible.findIndex((i) => i >= index),
+            const archiveNames = Array.isArray(settings.roleArchive) ? settings.roleArchive : [];
+            const archiveMatcher = getArchiveMatcher(archiveNames, settings.roleImageLibrary?.workNames);
+            const parkedNames = buildParkedNameSet(batch);
+            const { visibleIndices, displayIndices } = computeRoleDisplayOrder(
+                batch,
+                names,
+                archiveMatcher,
+                parkedNames,
             );
+            const { position, targetIndex } = currentDisplayPosition(visibleIndices, displayIndices, batch?.index ?? 0);
             roleRowsPage = Math.floor(position / ROLE_ROWS_PAGE);
             updateUI();
             // 翻到那一页后把正在生成的行滚到视野中间，省得自己找
-            const row = $(`#nag-role-results .nag-role-status-row[data-row-key^="${index}:"]`)[0];
+            const row = $(`#nag-role-results .nag-role-status-row[data-row-key^="${targetIndex}:"]`)[0];
             row?.scrollIntoView({ block: 'center' });
         });
         $('#nag-queue-add').on('click', () => {
@@ -2106,8 +2250,15 @@ export function initNovelUI(host) {
             const items = currentChatBatch()?.items || [];
             const item = this.dataset.id
                 ? items.find((entry) => entry.id === this.dataset.id)
-                : items[Number(this.dataset.index)];
-            toastr.warning(item?.error || item?.nameWarning || '这一项没有记录失败原因', undefined, { timeOut: 8000 });
+                : this.dataset.index != null
+                  ? items[Number(this.dataset.index)]
+                  : null;
+            const parkedEntry = this.dataset.name ? findRoleParked(settings.roleParked, this.dataset.name) : null;
+            toastr.warning(
+                item?.error || item?.nameWarning || parkedEntry?.error || '这一项没有记录失败原因',
+                undefined,
+                { timeOut: 8000 },
+            );
         });
         $('#nag-parked-restore-all').on('click', () => {
             if (fileOperation) return;
@@ -2127,7 +2278,7 @@ export function initNovelUI(host) {
             }
         });
         $('#nag-parked-copy').on('click', async () => {
-            const names = (currentChatBatch()?.items || []).filter((item) => item.parked).map((item) => item.name);
+            const names = getVisibleParkedEntries().map((item) => item.name);
             if (!names.length) return toastr.info('暂移区为空');
             const text = names.join('\n');
             try {
@@ -2178,7 +2329,13 @@ export function initNovelUI(host) {
         });
         $('#nag-role-results, #nag-parked-list').on('click', '.nag-queue-action', function () {
             try {
-                roleRunner.editQueue(this.dataset.action, this.dataset.id);
+                const action = this.dataset.action;
+                const id = this.dataset.id || '';
+                const name = this.dataset.name || '';
+                if (action === 'park' && (!id || !currentChatBatch()) && name) roleRunner.parkRole(name);
+                else if ((action === 'restore' || action === 'restore-origin') && (!id || !currentChatBatch()) && name)
+                    roleRunner.unparkRole(name, action);
+                else roleRunner.editQueue(action, id);
                 $('#nag-set-prompt').val(settings.roleNames);
                 saveSettings();
                 updateUI();
@@ -2854,9 +3011,12 @@ export function initNovelUI(host) {
             const elapsed = Date.now() - generationStats.startTime;
             const avg = elapsed / generationStats.chaptersGenerated;
             const batch = currentChatBatch();
-            const total = batch
-                ? batch.names.length - (batch.items || []).filter((item) => item.parked).length
-                : settings.totalChapters;
+            const roleNames = batch?.names || parseRoleNames(settings.roleNames);
+            const parkedNames = buildParkedNameSet(batch);
+            const parkedInRoster = roleNames.filter((name, index) =>
+                isRoleIndexParked(batch, parkedNames, index, name),
+            ).length;
+            const total = batch ? Math.max(0, batch.names.length - parkedInRoster) : settings.totalChapters;
             const completed = progressCountCache?.completed ?? settings.currentChapter;
             $('#nag-time-elapsed').text(formatDuration(elapsed));
             $('#nag-time-remaining').text(formatDuration(avg * Math.max(0, total - completed)));

@@ -196,6 +196,7 @@ it('persists a parked role across reload and rolls back queue edits when storage
     };
     expect(() => first.runner.editQueue('restore', parkedId)).toThrow();
     expect(first.settings.roleBatch.items.find((item) => item.id === parkedId).parked).toBe(true);
+    expect(first.settings.roleParked.map((entry) => entry.name)).toContain('丽莎');
     f.storage.setItem = savedSetItem;
     first.runner.stop();
     await vi.runAllTimersAsync();

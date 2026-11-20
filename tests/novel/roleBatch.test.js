@@ -7,12 +7,17 @@ import {
     countUnidentifiedRolePages,
     dedupeRoleArchive,
     duplicateRoleNames,
+    findRoleParked,
     mergeRoleArchive,
     normalizeRoleArchive,
+    normalizeRoleParked,
+    orderVisibleRoleIndices,
     removeRoleArchiveName,
     removeRoleArchiveMatches,
+    removeRoleParked,
     resolveRoleStatus,
     unidentifiedRolePageSignature,
+    upsertRoleParked,
 } from '../../src/novel/roleBatchState.js';
 
 afterEach(() => vi.useRealTimers());
@@ -1075,7 +1080,7 @@ it('manual generateOne generates only one next role or one explicitly picked rol
     expect(settings.roleBatch.items[1].processed).toBeFalsy();
 });
 
-it('isolates batches per chat, seamlessly continues in a new chat without restart, and preserves manual parks while retrying old failures', async () => {
+it('isolates batches per chat, seamlessly continues in a new chat without restart, and persists both failed and manual parked roles globally', async () => {
     vi.useFakeTimers();
     const values = new Map();
     const storage = { getItem: (k) => values.get(k) ?? null, setItem: (k, v) => values.set(k, v) };
@@ -1083,6 +1088,7 @@ it('isolates batches per chat, seamlessly continues in a new chat without restar
     const settings = {
         roleNames: '琴\n安柏\n丽莎\n芭芭拉',
         roleArchive: [],
+        roleParked: [],
         replyWaitTime: 0,
         roleBatch: null,
         roleBatches: {},
@@ -1131,23 +1137,203 @@ it('isolates batches per chat, seamlessly continues in a new chat without restar
     // 直接切换到新对话 chat-2（不点从头生成），直接 start() 无缝接续
     snapshot.identity = 'chat-2';
     expect(runner.activeBatch()).toBeNull();
+    expect(settings.roleParked).toEqual([
+        { name: '安柏', failed: true, error: '没有返回内容' },
+        { name: '丽莎', failed: false, error: null },
+    ]);
     const run2 = runner.start();
     await vi.runAllTimersAsync();
     await run2;
 
-    // 琴被自动从 chat-1 补录进名录并跳过；丽莎保留手动暂移；chat-2 只生成了旧失败的安柏和未做的芭芭拉！
-    expect(calls.filter((c) => c.chat === 'chat-2').map((c) => c.prompt)).toEqual(['生成 安柏', '生成 芭芭拉']);
-    expect(settings.roleArchive).toEqual(expect.arrayContaining(['琴', '安柏', '芭芭拉']));
+    // 琴被自动从 chat-1 补录进名录并跳过；安柏（失败暂移）与丽莎（手动暂移）均跨对话保持暂移；chat-2 只生成了未做的芭芭拉！
+    expect(calls.filter((c) => c.chat === 'chat-2').map((c) => c.prompt)).toEqual(['生成 芭芭拉']);
+    expect(settings.roleArchive).toEqual(expect.arrayContaining(['琴', '芭芭拉']));
+    expect(settings.roleBatches['chat-2'].items.find((item) => item.name === '安柏')).toMatchObject({
+        parked: true,
+        failed: true,
+        error: '没有返回内容',
+    });
     expect(settings.roleBatches['chat-2'].items.find((item) => item.name === '丽莎').parked).toBe(true);
     // 旧对话 chat-1 的独立批次完好无损，没有被新对话覆盖
     expect(settings.roleBatches['chat-1'].items.find((item) => item.name === '安柏').failed).toBe(true);
 
-    // 切回 chat-1 单独重置，不影响 chat-2
+    // 在 chat-2 把安柏单独手动生成成功后，应从全局 roleParked 移除并同步清除旧批次暂移状态
+    const retryAmber = runner.generateOne({ name: '安柏' });
+    await vi.runAllTimersAsync();
+    await retryAmber;
+    expect(settings.roleParked).toEqual([{ name: '丽莎', failed: false, error: null }]);
+    expect(settings.roleBatches['chat-2'].items.find((item) => item.name === '安柏')).toMatchObject({
+        parked: false,
+        failed: false,
+        processed: true,
+    });
+    expect(settings.roleBatches['chat-1'].items.find((item) => item.name === '安柏').parked).toBe(false);
+
+    // 切回 chat-1 单独重置，不影响 chat-2，也不丢失全局暂移区里的丽莎
     snapshot.identity = 'chat-1';
     delete settings.roleBatches['chat-1'].preview;
     await runner.resetPending({ restart: true });
     expect(settings.roleBatches['chat-1']).toBeUndefined();
     expect(settings.roleBatches['chat-2']).toBeDefined();
+    expect(settings.roleParked).toEqual([{ name: '丽莎', failed: false, error: null }]);
     snapshot.identity = 'chat-2';
     expect(runner.activeBatch()?.identity).toBe('chat-2');
+});
+
+it('supports parkRole, unparkRole, and restoreAllParked in a brand-new chat before any batch exists', () => {
+    const settings = {
+        roleNames: '琴\n安柏\n丽莎\n芭芭拉',
+        roleArchive: ['琴'],
+        roleParked: [],
+        roleBatch: null,
+        roleBatches: {},
+    };
+    const onChange = vi.fn();
+    const runner = createRoleBatchRunner({
+        getSettings: () => settings,
+        host: { snapshot: () => ({ identity: 'chat-new', generating: false, connected: true }) },
+        onChange,
+        notify: vi.fn(),
+        onStats: vi.fn(),
+    });
+
+    expect(runner.activeBatch()).toBeNull();
+    // 已在名录里的完成角色不允许暂移
+    expect(() => runner.parkRole('琴')).toThrow('已完成');
+    // 聊天底栏「⏸ 暂移」在新对话未建批次前可直接把待生成角色移入全局暂移区
+    expect(runner.parkRole('安柏')).toBe(true);
+    expect(runner.parkRole('丽莎')).toBe(true);
+    expect(settings.roleParked).toEqual([
+        { name: '安柏', failed: false, error: null },
+        { name: '丽莎', failed: false, error: null },
+    ]);
+    expect(runner.activeBatch()).toBeNull();
+
+    // 放回队尾：从全局暂移移除并把名单中对应角色移到末尾
+    expect(runner.unparkRole('安柏', 'restore')).toBe(true);
+    expect(settings.roleParked).toEqual([{ name: '丽莎', failed: false, error: null }]);
+    expect(settings.roleNames).toBe('琴\n丽莎\n芭芭拉\n安柏');
+
+    // 全部放回队列：同样支持未建批次时直接清空全局暂移并将对应项移到名单末尾
+    expect(runner.restoreAllParked()).toBe(1);
+    expect(settings.roleParked).toEqual([]);
+    expect(settings.roleNames).toBe('琴\n芭芭拉\n安柏\n丽莎');
+});
+
+it('migrates legacy parked roles from older chats on upgrade while skipping completed and explicitly unparked items', () => {
+    const settings = {
+        roleNames: '琴\n安柏\n丽莎\n芭芭拉\n诺艾尔',
+        roleArchive: ['琴'],
+        roleBatches: {
+            'chat-old': {
+                id: 'b-old',
+                identity: 'chat-old',
+                updatedAt: 100,
+                names: ['琴', '安柏', '丽莎', '芭芭拉', '诺艾尔'],
+                items: [
+                    { id: '1', name: '琴', processed: true, failed: false },
+                    { id: '2', name: '安柏', processed: true, failed: true, parked: true, error: '内容截断' },
+                    { id: '3', name: '丽莎', parked: true },
+                    { id: '4', name: '芭芭拉', parked: true },
+                    { id: '5', name: '诺艾尔', parked: true },
+                ],
+                history: [],
+            },
+            'chat-new': {
+                id: 'b-new',
+                identity: 'chat-new',
+                updatedAt: 200,
+                names: ['琴', '安柏', '丽莎', '芭芭拉', '诺艾尔'],
+                items: [
+                    { id: '11', name: '琴', archived: true, processed: true, failed: false },
+                    // 模拟 v2.2.0 升级前：新对话里失败暂移的安柏被未触碰重建（parked 为 undefined）
+                    { id: '12', name: '安柏' },
+                    // 丽莎在新对话里被用户显式放回（parked === false）
+                    { id: '13', name: '丽莎', parked: false },
+                    // 芭芭拉在新对话里已生成完成
+                    { id: '14', name: '芭芭拉', processed: true, failed: false },
+                    // 诺艾尔仍保持手动暂移
+                    { id: '15', name: '诺艾尔', parked: true },
+                ],
+                history: [],
+            },
+        },
+    };
+    const runner = createRoleBatchRunner({
+        getSettings: () => settings,
+        host: { snapshot: () => ({ identity: 'chat-new', generating: false, connected: true }) },
+        onChange: vi.fn(),
+        notify: vi.fn(),
+        onStats: vi.fn(),
+    });
+    const migrated = runner.migrateParkedFromBatches();
+    expect(migrated).toEqual([
+        { name: '诺艾尔', failed: false, error: null },
+        { name: '安柏', failed: true, error: '内容截断' },
+    ]);
+    expect(settings.roleParked).toEqual(migrated);
+    expect(settings.roleBatches['chat-new'].items[1]).toMatchObject({
+        id: '12',
+        name: '安柏',
+        parked: true,
+        failed: true,
+        error: '内容截断',
+    });
+    // 升级迁移后可直接放回原处，同时从全局 roleParked 清除
+    runner.editQueue('restore-origin', '12');
+    expect(settings.roleBatches['chat-new'].items[1].parked).toBe(false);
+    expect(settings.roleParked).toEqual([{ name: '诺艾尔', failed: false, error: null }]);
+});
+
+it('normalizes, updates, queries, and removes global roleParked entries cleanly', () => {
+    const normalized = normalizeRoleParked([
+        ' 琴 ',
+        { name: '安柏', failed: true, error: '截断' },
+        { name: '琴', failed: true, error: '重复忽略' },
+        null,
+        '',
+    ]);
+    expect(normalized).toEqual([
+        { name: '琴', failed: false, error: null },
+        { name: '安柏', failed: true, error: '截断' },
+    ]);
+    const updated = upsertRoleParked(normalized, { name: '琴', failed: true, error: 'Token 不足' });
+    expect(findRoleParked(updated, ' 琴 ')).toEqual({ name: '琴', failed: true, error: 'Token 不足' });
+    expect(removeRoleParked(updated, ['琴'])).toEqual([{ name: '安柏', failed: true, error: '截断' }]);
+});
+
+it('orderVisibleRoleIndices displays pending/failed roles before completed ones without mutating original order', () => {
+    const original = [0, 1, 2, 3, 4, 5];
+    const items = [
+        { processed: true, failed: false }, // 0: complete
+        { archived: true, processed: true, failed: false }, // 1: archived complete
+        { processing: false }, // 2: queued
+        { processed: true, failed: true }, // 3: failed
+        { manualStatus: 'complete' }, // 4: manual complete
+        { processing: true }, // 5: processing
+    ];
+    const isCompleteAt = (index) => resolveRoleStatus(items[index]).complete;
+    expect(orderVisibleRoleIndices(original, isCompleteAt, 'original')).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(orderVisibleRoleIndices(original, isCompleteAt, 'pending-first')).toEqual([2, 3, 5, 0, 1, 4]);
+    // 绝不改动原始数组（严格遵循仅展示排序，不改变真实名单与生成顺序）
+    expect(original).toEqual([0, 1, 2, 3, 4, 5]);
+});
+
+it('allows parking an unparked failed role via parkRole and preserves its failure metadata', async () => {
+    vi.useFakeTimers();
+    const { settings, runner } = setup([{ text: '' }, { text: '完成安柏' }]);
+    settings.roleNames = '琴\n安柏';
+    const first = runner.start();
+    await vi.runAllTimersAsync();
+    await first;
+    const qin = settings.roleBatch.items[0];
+    expect(qin).toMatchObject({ name: '琴', failed: true, parked: true, error: '没有返回内容' });
+    // 先放回原处
+    runner.editQueue('restore-origin', qin.id);
+    expect(settings.roleParked).toEqual([]);
+    expect(qin.parked).toBe(false);
+    // 再次通过底栏 parkRole 暂移这个未暂移的失败角色
+    expect(runner.parkRole('琴')).toBe(true);
+    expect(qin.parked).toBe(true);
+    expect(settings.roleParked).toEqual([{ name: '琴', failed: true, error: '没有返回内容' }]);
 });
