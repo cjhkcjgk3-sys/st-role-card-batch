@@ -49,6 +49,8 @@ export function initNovelUI(host) {
         generationMode: 'novel',
         roleNames: '',
         roleBatch: null,
+        // 按聊天 identity 分开保存的批量任务，换新对话无缝接续、切回旧对话互不覆盖。
+        roleBatches: {},
         roleImageLibrary: null,
         // 已完成角色名录（全局共用）：生成名单里出现这个名字时自动跳过，避免重复生成。
         roleArchive: [],
@@ -117,7 +119,8 @@ export function initNovelUI(host) {
     let progressCountCache = null;
     let duplicateNamesCache = null;
     let unknownPagesCache = null;
-    const pluginVersion = '2.1.1';
+    let lastUiIdentity = null;
+    const pluginVersion = '2.2.0';
     function invalidateRoleArchive() {
         archiveRevision++;
         archiveMatcherCache = null;
@@ -643,12 +646,17 @@ export function initNovelUI(host) {
             rememberArchiveName(name);
         },
     });
+    /** 严格读取当前活跃聊天对应的批次（切到新对话时返回 null，避免串显旧对话进度）。 */
+    function currentChatBatch() {
+        return roleRunner?.activeBatch?.() ?? null;
+    }
+
     let imageSkipNoticeBatch = null;
     resultIsolation = host.createRoleResultIsolation({
         getBatch: () =>
-            settings.generationMode === 'role-batch' && settings.isolateRoleResult ? settings.roleBatch : null,
+            settings.generationMode === 'role-batch' && settings.isolateRoleResult ? currentChatBatch() : null,
         getRoleImage: (request) => {
-            const batch = settings.roleBatch;
+            const batch = currentChatBatch();
             if (
                 settings.generationMode !== 'role-batch' ||
                 !batch ||
@@ -1084,7 +1092,7 @@ export function initNovelUI(host) {
 
     /** Full-screen viewer: the original image is only fetched here, on demand. */
     function showRoleImagePreview(index) {
-        const name = (settings.roleBatch?.names || parseRoleNames(settings.roleNames))[index];
+        const name = (currentChatBatch()?.names || parseRoleNames(settings.roleNames))[index];
         const image = name ? matchRoleImage(name, settings.roleImageLibrary).item : null;
         const preview = document.getElementById('nag-role-image-preview');
         const imageElement = preview?.querySelector('img');
@@ -1317,7 +1325,7 @@ export function initNovelUI(host) {
 
     /** 查找下一个在手动模式下将要生成的角色名（跳过已完成、名录与暂移项）。 */
     function nextManualRoleName() {
-        const batch = settings.roleBatch;
+        const batch = currentChatBatch();
         const names = batch?.names || parseRoleNames(settings.roleNames);
         if (!names.length) return null;
         const archiveNames = Array.isArray(settings.roleArchive) ? settings.roleArchive : [];
@@ -1334,7 +1342,7 @@ export function initNovelUI(host) {
     function isWriteCardChat() {
         const identity = host.snapshot().identity;
         if (identity == null) return false;
-        const batch = settings.roleBatch;
+        const batch = currentChatBatch();
         if (batch && batch.identity === identity) return true;
         const names = parseRoleNames(settings.roleNames);
         if (!names.length) return false;
@@ -1412,10 +1420,11 @@ export function initNovelUI(host) {
     }
 
     function updateUI() {
+        lastUiIdentity = host.snapshot().identity ?? null;
         resultIsolation?.refresh();
         roleSelection?.refresh();
         const batchMode = settings.generationMode === 'role-batch';
-        const batch = settings.roleBatch;
+        const batch = batchMode ? currentChatBatch() : null;
         if (batchMode && batch && !settings.isRunning && !fileOperation && settings.roleNames !== batch.inputNames) {
             const parsed = parseRoleNames(settings.roleNames);
             const namesChanged =
@@ -1449,7 +1458,7 @@ export function initNovelUI(host) {
             ? roleNames.length - (batch?.items || []).filter((item) => item.parked).length
             : settings.totalChapters;
         let completed = batchMode ? 0 : settings.currentChapter;
-        if (batchMode && batch) {
+        if (batchMode) {
             const cached = progressCountCache;
             if (
                 cached &&
@@ -2059,10 +2068,11 @@ export function initNovelUI(host) {
             $('#nag-role-results').scrollTop(0);
         });
         $('#nag-role-rows-jump').on('click', () => {
-            const names = settings.roleBatch?.names || parseRoleNames(settings.roleNames);
+            const batch = currentChatBatch();
+            const names = batch?.names || parseRoleNames(settings.roleNames);
             if (!names.length) return;
-            const index = Math.min(names.length - 1, Math.max(0, settings.roleBatch?.index ?? 0));
-            const visible = names.map((_, i) => i).filter((i) => !settings.roleBatch?.items[i]?.parked);
+            const index = Math.min(names.length - 1, Math.max(0, batch?.index ?? 0));
+            const visible = names.map((_, i) => i).filter((i) => !batch?.items[i]?.parked);
             const position = Math.max(
                 0,
                 visible.findIndex((i) => i >= index),
@@ -2093,7 +2103,7 @@ export function initNovelUI(host) {
             $('#nag-archive-list').scrollTop(0);
         });
         $('#nag-role-results, #nag-parked-list').on('click', '.nag-role-failure', function () {
-            const items = settings.roleBatch?.items || [];
+            const items = currentChatBatch()?.items || [];
             const item = this.dataset.id
                 ? items.find((entry) => entry.id === this.dataset.id)
                 : items[Number(this.dataset.index)];
@@ -2117,7 +2127,7 @@ export function initNovelUI(host) {
             }
         });
         $('#nag-parked-copy').on('click', async () => {
-            const names = (settings.roleBatch?.items || []).filter((item) => item.parked).map((item) => item.name);
+            const names = (currentChatBatch()?.items || []).filter((item) => item.parked).map((item) => item.name);
             if (!names.length) return toastr.info('暂移区为空');
             const text = names.join('\n');
             try {
@@ -2291,7 +2301,7 @@ export function initNovelUI(host) {
         });
         $('#nag-btn-restore-prompt').on('click', async () => {
             if (settings.isRunning || fileOperation) return;
-            const batch = settings.roleBatch;
+            const batch = currentChatBatch();
             if (!batch || batch.identity !== host.snapshot().identity)
                 return toastr.warning('请回到原批次聊天后再恢复提示词');
             if (!String(batch.template || '').includes('[[角色名]]'))
@@ -2327,8 +2337,8 @@ export function initNovelUI(host) {
             );
         });
         $('#nag-btn-archive-collect').on('click', () => {
-            const batch = settings.roleBatch;
-            if (!batch) return toastr.info('当前没有批量任务记录');
+            const batch = currentChatBatch();
+            if (!batch) return toastr.info('当前聊天没有批量任务记录');
             const names = [...(batch.items || []), ...(batch.history || [])]
                 .filter((item) => roleComplete(item) && item.name)
                 .map((item) => item.name);
@@ -2704,18 +2714,22 @@ export function initNovelUI(host) {
         createUI();
         roleSelection = createRoleSelectionUI({
             host,
-            getBatch: () => (settings.generationMode === 'role-batch' ? settings.roleBatch : null),
+            getBatch: () => (settings.generationMode === 'role-batch' ? currentChatBatch() : null),
             getRosterNames: () => parseRoleNames(settings.roleNames),
             getWorkNames: () => settings.roleImageLibrary?.workNames || [],
             isBusy: () => settings.isRunning || fileOperation,
             onReroll: rerollCurrentRole,
-            onRefresh: syncChatManualBar,
+            onRefresh: () => {
+                const nowIdentity = host.snapshot().identity ?? null;
+                if (nowIdentity !== lastUiIdentity) updateUI();
+                else syncChatManualBar();
+            },
             onPreview: {
                 compare: () =>
                     runRoleAction(async () => {
                         for (const notice of roleSuccessNotices) toastr.clear(notice);
                         roleSuccessNotices = [];
-                        const batch = settings.roleBatch;
+                        const batch = currentChatBatch();
                         const comparison = await host.getRoleComparison(batch);
                         const show = host.getContext()?.Popup?.show?.text;
                         if (typeof show !== 'function') throw new Error('当前酒馆无法打开对比窗口');
@@ -2839,7 +2853,7 @@ export function initNovelUI(host) {
             if (!generationStats.startTime || generationStats.chaptersGenerated <= 0) return;
             const elapsed = Date.now() - generationStats.startTime;
             const avg = elapsed / generationStats.chaptersGenerated;
-            const batch = settings.roleBatch;
+            const batch = currentChatBatch();
             const total = batch
                 ? batch.names.length - (batch.items || []).filter((item) => item.parked).length
                 : settings.totalChapters;

@@ -32,12 +32,100 @@ export function createRoleBatchRunner({
     randomWaitMs = () => 5000 + Math.floor(Math.random() * 15001),
     recoveryWaitMs = () => 20000 + Math.floor(Math.random() * 10001),
 }) {
+    const MAX_STORED_BATCHES = 30;
     let active = null;
     let preparing = false;
-    let restored = false;
+    const restoredChats = new Set();
     // Chat where the user just confirmed “从头生成”; its existing pages count as reviewed once.
     let restartIdentity = null;
-    const state = () => getSettings().roleBatch;
+    let lastSyncedIdentity = null;
+    const currentIdentity = () => host.snapshot()?.identity;
+    function ensureBatchMap(settings) {
+        if (!settings.roleBatches || typeof settings.roleBatches !== 'object' || Array.isArray(settings.roleBatches)) {
+            settings.roleBatches = {};
+        }
+        const legacy = settings.roleBatch;
+        if (
+            legacy &&
+            typeof legacy.identity === 'string' &&
+            legacy.identity &&
+            !settings.roleBatches[legacy.identity]
+        ) {
+            settings.roleBatches[legacy.identity] = legacy;
+        }
+        return settings.roleBatches;
+    }
+    function pruneBatchMap(map, keepIdentity) {
+        const keys = Object.keys(map);
+        if (keys.length <= MAX_STORED_BATCHES) return;
+        keys.filter((key) => key !== keepIdentity)
+            .sort((a, b) => (map[a]?.updatedAt || 0) - (map[b]?.updatedAt || 0))
+            .slice(0, keys.length - MAX_STORED_BATCHES)
+            .forEach((key) => {
+                delete map[key];
+            });
+    }
+    function state(identity = currentIdentity()) {
+        const settings = getSettings();
+        const map = ensureBatchMap(settings);
+        if (typeof identity === 'string' && identity) {
+            if (lastSyncedIdentity === identity && settings.roleBatch === null && map[identity]) {
+                delete map[identity];
+            }
+            const batch = map[identity] ?? null;
+            if (!active || active.identity === identity) {
+                settings.roleBatch = batch;
+                lastSyncedIdentity = identity;
+            }
+            return batch;
+        }
+        return settings.roleBatch ?? null;
+    }
+    function setState(batch, identity = batch?.identity ?? currentIdentity()) {
+        const settings = getSettings();
+        const map = ensureBatchMap(settings);
+        if (typeof identity === 'string' && identity) {
+            if (batch) {
+                map[identity] = batch;
+                pruneBatchMap(map, identity);
+            } else {
+                delete map[identity];
+            }
+        }
+        if (!active || active.identity === identity) {
+            settings.roleBatch = batch ?? null;
+            lastSyncedIdentity = typeof identity === 'string' && identity ? identity : null;
+        }
+        return batch;
+    }
+    /** 跨对话新建批次前，自动把历史对话里所有真正已完成的角色补录进全局名录，防止重复生成。 */
+    function syncCompletedAcrossChatsToArchive() {
+        const settings = getSettings();
+        const map = ensureBatchMap(settings);
+        for (const oldBatch of Object.values(map)) {
+            for (const item of [...(oldBatch?.items || []), ...(oldBatch?.history || [])]) {
+                if (item?.processed && !item.failed && !item.archived && item.manualStatus !== 'failed' && item.name) {
+                    onRoleComplete(item.name);
+                }
+            }
+        }
+    }
+    /** 收集最近一次其他对话里被用户主动手动暂移（非失败）的角色名，供新对话沿用。 */
+    function collectManualParkedNames(excludeIdentity) {
+        const settings = getSettings();
+        const map = ensureBatchMap(settings);
+        const others = Object.entries(map)
+            .filter(([key, value]) => key !== excludeIdentity && value)
+            .sort(([, a], [, b]) => (b?.updatedAt || 0) - (a?.updatedAt || 0));
+        const parked = new Set();
+        if (others.length) {
+            const [, latest] = others[0];
+            for (const item of latest.items || []) {
+                if (item?.parked && !item.failed && item.name) parked.add(item.name);
+            }
+        }
+        return parked;
+    }
     const validationOptions = () => ({
         minLength: getSettings().minChapterLength,
         minTokens: Math.max(0, Number(getSettings().minRoleTokens) || 0),
@@ -50,13 +138,14 @@ export function createRoleBatchRunner({
         }
         return '角色卡未闭合或内容截断';
     };
-    function checkpoint() {
-        const batch = state();
+    function checkpoint(targetIdentity = active?.identity ?? currentIdentity()) {
+        const batch = state(targetIdentity);
         try {
             if (batch) {
                 batch.updatedAt = Date.now();
                 batch.revision = (batch.revision || 0) + 1;
-                recovery?.write(batch);
+                if (typeof recovery?.writeForChat === 'function') recovery.writeForChat(batch.identity, batch);
+                else recovery?.write?.(batch);
             }
         } catch {
             throw Object.assign(new Error('无法保存批量任务进度，已停止派发；请查看错误日志'), {
@@ -70,20 +159,32 @@ export function createRoleBatchRunner({
             onError(uiError, { phase: 'checkpoint-ui' });
         }
     }
-    function restore() {
-        if (restored) return;
-        const saved = recovery?.read();
+    function restore(identity = currentIdentity()) {
+        const slotKey = typeof identity === 'string' && identity ? identity : '__default__';
+        if (restoredChats.has(slotKey)) return state(identity);
         const settings = getSettings();
-        if (saved && saved.updatedAt >= (settings.roleBatch?.updatedAt || 0)) {
-            settings.roleBatch = saved.cleared ? null : saved;
-            if (!saved.cleared) {
-                settings.roleNames = saved.inputNames ?? saved.names.join('\n');
+        const existing = state(identity);
+        const saved = typeof recovery?.readForChat === 'function' ? recovery.readForChat(identity) : recovery?.read?.();
+        const matchesSlot =
+            saved &&
+            (saved.cleared ||
+                typeof identity !== 'string' ||
+                !identity ||
+                !saved.identity ||
+                saved.identity === identity);
+        if (matchesSlot && saved.updatedAt >= (existing?.updatedAt || 0)) {
+            const nextBatch = saved.cleared ? null : saved;
+            setState(nextBatch, identity);
+            if (nextBatch) {
+                settings.roleNames = nextBatch.inputNames ?? nextBatch.names.join('\n');
                 if (settings.generationMode !== 'novel')
-                    settings.totalChapters = saved.inputLimit ?? saved.names.length;
+                    settings.totalChapters = nextBatch.inputLimit ?? nextBatch.names.length;
             }
         }
-        hydrateRoleBatch(settings.roleBatch);
-        restored = true;
+        const current = state(identity);
+        hydrateRoleBatch(current);
+        restoredChats.add(slotKey);
+        return current;
     }
     function saveInput() {
         const batch = state();
@@ -174,7 +275,7 @@ export function createRoleBatchRunner({
         let ready = false;
         let explicitTargetIndex = -1;
         try {
-            restore();
+            restore(initial.identity);
             if (initial.identity == null || initial.generating === true)
                 throw new Error('请打开写卡助手聊天，并等待当前生成结束');
             if (recovery && typeof initial.identity !== 'string')
@@ -182,25 +283,32 @@ export function createRoleBatchRunner({
             const names = parseRoleNames(settings.roleNames);
             settings.totalChapters = names.length;
             if (!names.length) throw new Error('请在角色名单中每行填写一个名字');
-            let batch = state();
-            if (batch && batch.identity !== initial.identity)
-                throw new Error('请返回原聊天继续；要在当前聊天新建批次，请先使用“从头生成”');
+            let batch = state(initial.identity);
             if (batch) assertNoPreview(batch);
             if (!batch) {
+                // 新开对话自动无缝接续：先确保历史对话已完成项全部补录进全局名录，并沿用主动手动暂移的角色。
+                syncCompletedAcrossChatsToArchive();
+                const manualParked = collectManualParkedNames(initial.identity);
                 const target = host.prepareRoleBatch();
                 if (!target.template.includes(ROLE_PLACEHOLDER))
                     throw new Error(`最后一条用户消息需要包含 ${ROLE_PLACEHOLDER}`);
-                batch = settings.roleBatch = {
-                    id: newIdentity('role-batch'),
-                    identity: initial.identity,
-                    ...target,
-                    names,
-                    index: 0,
-                    attempt: 0,
-                    pending: false,
-                    items: [],
-                };
+                batch = setState(
+                    {
+                        id: newIdentity('role-batch'),
+                        identity: initial.identity,
+                        ...target,
+                        names,
+                        index: 0,
+                        attempt: 0,
+                        pending: false,
+                        items: [],
+                    },
+                    initial.identity,
+                );
                 hydrateRoleBatch(batch);
+                for (const item of batch.items || []) {
+                    if (manualParked.has(item.name)) item.parked = true;
+                }
                 if (restartIdentity === initial.identity) batch.restartReviewed = true;
             }
             restartIdentity = null;
@@ -257,7 +365,7 @@ export function createRoleBatchRunner({
             }
         }
         try {
-            const batch = state();
+            const batch = state(run.identity);
             let recoveryFailures = 0;
             let processedInRun = 0;
             while (batch.index < batch.names.length) {
@@ -442,11 +550,11 @@ export function createRoleBatchRunner({
         } catch (error) {
             if (!run.controller.signal.aborted) {
                 if (error.code === 'CHECKPOINT_FAILED') onError(error, { phase: 'save-recovery' });
-                stats.errors.push({ chapter: state().index + 1, error: error.message });
+                stats.errors.push({ chapter: (state(run.identity)?.index ?? 0) + 1, error: error.message });
                 notify('warning', error.message);
             }
         } finally {
-            const batch = state();
+            const batch = state(run.identity);
             if (!batch?.pending && host.snapshot().identity === run.identity) {
                 try {
                     await host.restoreRoleTemplate?.(batch);
@@ -455,16 +563,18 @@ export function createRoleBatchRunner({
                     notify('warning', `恢复提示词模板失败：${error.message}`);
                 }
             }
-            const item = state()?.items[state().index];
+            const item = batch?.items?.[batch.index];
             if (item?.processing) item.processing = false;
-            active = null;
-            settings.isRunning = false;
-            settings.isPaused = false;
             try {
-                checkpoint();
+                checkpoint(run.identity);
             } catch (error) {
                 onError(error, { phase: 'save-recovery' });
                 notify('warning', error.message);
+            } finally {
+                active = null;
+                settings.isRunning = false;
+                settings.isPaused = false;
+                onChange();
             }
         }
     }
@@ -484,8 +594,8 @@ export function createRoleBatchRunner({
             committed = false,
             promptSent = false;
         try {
-            restore();
-            batch = state();
+            restore(initial.identity);
+            batch = state(initial.identity);
             if (initial.generating === true) throw new Error('请先等待酒馆当前生成结束');
             if (initial.connected === false) throw new Error('酒馆 API 尚未连接');
             const rosterNames = parseRoleNames(settings.roleNames);
@@ -496,16 +606,19 @@ export function createRoleBatchRunner({
                 const prepared = host.prepareRoleBatch();
                 if (!prepared.template.includes(ROLE_PLACEHOLDER))
                     throw new Error(`最后一条用户消息需要包含 ${ROLE_PLACEHOLDER}`);
-                batch = settings.roleBatch = {
-                    id: newIdentity('role-batch'),
-                    identity: initial.identity,
-                    ...prepared,
-                    names: rosterNames,
-                    index: 0,
-                    attempt: 0,
-                    pending: false,
-                    items: [],
-                };
+                batch = setState(
+                    {
+                        id: newIdentity('role-batch'),
+                        identity: initial.identity,
+                        ...prepared,
+                        names: rosterNames,
+                        index: 0,
+                        attempt: 0,
+                        pending: false,
+                        items: [],
+                    },
+                    initial.identity,
+                );
                 hydrateRoleBatch(batch);
             }
             const previousDispatch = batch.pending && batch.dispatch ? { ...batch.dispatch } : null;
@@ -649,7 +762,7 @@ export function createRoleBatchRunner({
             settings.isPaused = false;
             if (batch) {
                 try {
-                    checkpoint();
+                    checkpoint(batch.identity);
                 } catch (error) {
                     onError(error, { phase: 'save-recovery' });
                 }
@@ -766,7 +879,7 @@ export function createRoleBatchRunner({
             settings.isPaused = false;
             if (batch) {
                 try {
-                    checkpoint();
+                    checkpoint(batch.identity);
                 } catch (error) {
                     onError(error, { phase: 'save-recovery' });
                 }
@@ -862,6 +975,10 @@ export function createRoleBatchRunner({
         discardPreview: () => resolvePreview(false),
         previewPending: () => !!state()?.preview,
         restore,
+        activeBatch() {
+            restore();
+            return state();
+        },
         saveInput,
         editQueue(action, itemId, targetId) {
             const batch = state();
@@ -1015,23 +1132,29 @@ export function createRoleBatchRunner({
             if (previousArchive.length === next.length && previousArchive.every((name, index) => name === next[index]))
                 return { added: [], removed: [] };
             const batch = state();
+            const allBatches = Object.values(ensureBatchMap(settings)).filter(Boolean);
             preparing = true;
-            let archiveChanges = null;
+            const archiveChangesList = [];
             try {
                 settings.roleArchive = next;
-                archiveChanges = applyRoleArchiveChanges(
-                    batch,
-                    previousArchive,
-                    next,
-                    settings.roleImageLibrary?.workNames,
-                );
+                let currentChanges = { added: [], removed: [] };
+                for (const entryBatch of allBatches) {
+                    const changes = applyRoleArchiveChanges(
+                        entryBatch,
+                        previousArchive,
+                        next,
+                        settings.roleImageLibrary?.workNames,
+                    );
+                    archiveChangesList.push(changes);
+                    if (entryBatch === batch) currentChanges = changes;
+                }
                 onRoleArchiveChange();
-                if (batch) checkpoint();
+                if (batch) checkpoint(batch.identity);
                 else onChange();
-                return { added: archiveChanges.added, removed: archiveChanges.removed };
+                return { added: currentChanges.added, removed: currentChanges.removed };
             } catch (error) {
                 settings.roleArchive = previousArchive;
-                archiveChanges?.rollback?.();
+                for (const changes of archiveChangesList) changes?.rollback?.();
                 onRoleArchiveChange();
                 throw error;
             } finally {
@@ -1264,22 +1387,25 @@ export function createRoleBatchRunner({
             if (active || preparing) return;
             preparing = true;
             try {
-                const batch = state();
+                const identity = currentIdentity();
+                restore(identity);
+                const batch = state(identity);
                 if (batch?.preview) assertNoPreview(batch);
-                if (batch && (!restart || batch.identity === host.snapshot().identity)) {
+                if (batch && (!restart || batch.identity === identity)) {
                     if (!restart) await host.reconcileRoleBatch?.(batch, validationOptions());
                     await host.restoreRoleTemplate?.(batch);
                 }
                 if (restart) {
-                    restartIdentity = host.snapshot().identity;
-                    recovery?.clear();
-                    getSettings().roleBatch = null;
-                    restored = true;
+                    restartIdentity = identity;
+                    if (typeof recovery?.clearForChat === 'function') recovery.clearForChat(identity);
+                    else recovery?.clear?.();
+                    setState(null, identity);
+                    restoredChats.add(typeof identity === 'string' && identity ? identity : '__default__');
                     onChange();
                 } else if (batch) {
                     hydrateRoleBatch(batch);
                     batch.index = nextRoleIndex(batch);
-                    checkpoint();
+                    checkpoint(identity);
                 }
             } finally {
                 preparing = false;

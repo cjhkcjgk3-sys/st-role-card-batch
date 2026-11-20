@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
+import { createRoleBatchRecoveryStore } from '../../src/novel/recoveryStore.js';
 import { createRoleBatchRunner, parseRoleNames } from '../../src/novel/roleBatch.js';
 import {
     applyArchiveSkips,
@@ -1072,4 +1073,81 @@ it('manual generateOne generates only one next role or one explicitly picked rol
     expect(host.generateRoleReply.mock.calls[1][1]).toContain('丽莎');
     expect(settings.roleBatch.items[2]).toMatchObject({ name: '丽莎', processed: true, failed: false });
     expect(settings.roleBatch.items[1].processed).toBeFalsy();
+});
+
+it('isolates batches per chat, seamlessly continues in a new chat without restart, and preserves manual parks while retrying old failures', async () => {
+    vi.useFakeTimers();
+    const values = new Map();
+    const storage = { getItem: (k) => values.get(k) ?? null, setItem: (k, v) => values.set(k, v) };
+    const recovery = createRoleBatchRecoveryStore(() => storage);
+    const settings = {
+        roleNames: '琴\n安柏\n丽莎\n芭芭拉',
+        roleArchive: [],
+        replyWaitTime: 0,
+        roleBatch: null,
+        roleBatches: {},
+    };
+    const snapshot = { identity: 'chat-1', generating: false, connected: true };
+    const calls = [];
+    const host = {
+        snapshot: () => snapshot,
+        prepareRoleBatch: () => ({ promptFloor: 1, resultFloor: null, template: '生成 [[角色名]]' }),
+        reconcileRoleBatch: vi.fn(async () => {}),
+        restoreRoleTemplate: vi.fn(async () => {}),
+        generateRoleReply: vi.fn(async (batch, prompt) => {
+            calls.push({ chat: batch.identity, prompt });
+            if (batch.identity === 'chat-1' && prompt.includes('安柏')) return { text: '' };
+            return { text: `完成：${prompt}`, swipe: calls.length - 1 };
+        }),
+    };
+    const onRoleComplete = (name) => {
+        if (!settings.roleArchive.includes(name)) settings.roleArchive.push(name);
+    };
+    const runner = createRoleBatchRunner({
+        getSettings: () => settings,
+        host,
+        recovery,
+        onChange: vi.fn(),
+        notify: vi.fn(),
+        onStats: vi.fn(),
+        onRoleComplete,
+        onRoleArchiveChange: vi.fn(),
+        randomWaitMs: () => 0,
+    });
+
+    // 在旧对话 chat-1 先单步跑琴（成功）、再跑安柏（失败自动暂移），并手动暂移丽莎
+    const step1 = runner.generateOne();
+    await vi.runAllTimersAsync();
+    await step1;
+    const step2 = runner.generateOne();
+    await vi.runAllTimersAsync();
+    await step2;
+    const lisa = settings.roleBatches['chat-1'].items.find((item) => item.name === '丽莎');
+    runner.editQueue('park', lisa.id);
+    // 模拟极端情况：琴虽然在 chat-1 完成但尚未入名录，且 chat-1 还有一个未结束的 preview
+    settings.roleArchive = [];
+    settings.roleBatches['chat-1'].preview = { id: 'p-old', name: '琴' };
+
+    // 直接切换到新对话 chat-2（不点从头生成），直接 start() 无缝接续
+    snapshot.identity = 'chat-2';
+    expect(runner.activeBatch()).toBeNull();
+    const run2 = runner.start();
+    await vi.runAllTimersAsync();
+    await run2;
+
+    // 琴被自动从 chat-1 补录进名录并跳过；丽莎保留手动暂移；chat-2 只生成了旧失败的安柏和未做的芭芭拉！
+    expect(calls.filter((c) => c.chat === 'chat-2').map((c) => c.prompt)).toEqual(['生成 安柏', '生成 芭芭拉']);
+    expect(settings.roleArchive).toEqual(expect.arrayContaining(['琴', '安柏', '芭芭拉']));
+    expect(settings.roleBatches['chat-2'].items.find((item) => item.name === '丽莎').parked).toBe(true);
+    // 旧对话 chat-1 的独立批次完好无损，没有被新对话覆盖
+    expect(settings.roleBatches['chat-1'].items.find((item) => item.name === '安柏').failed).toBe(true);
+
+    // 切回 chat-1 单独重置，不影响 chat-2
+    snapshot.identity = 'chat-1';
+    delete settings.roleBatches['chat-1'].preview;
+    await runner.resetPending({ restart: true });
+    expect(settings.roleBatches['chat-1']).toBeUndefined();
+    expect(settings.roleBatches['chat-2']).toBeDefined();
+    snapshot.identity = 'chat-2';
+    expect(runner.activeBatch()?.identity).toBe('chat-2');
 });
