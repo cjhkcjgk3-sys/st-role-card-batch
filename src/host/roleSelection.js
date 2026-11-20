@@ -1,3 +1,6 @@
+import { extractRoleCardNames } from '../novel/tagFilters.js';
+import { matchRoleCardToCandidates } from '../novel/roleBatchState.js';
+
 /** Resolve the selected native swipe through the batch receipt, never by parsing character text. */
 export function selectedRole(batch, message) {
     if (!batch || !message || message.is_user || message.is_system) return null;
@@ -15,6 +18,58 @@ export function selectedRole(batch, message) {
     return { item: matches[0], index };
 }
 
+/**
+ * 解析当前备选页的可重生成目标，不再死绑“进行中的批次”：
+ * 1) 优先复用严格的 selectedRole 绑定；
+ * 2) 若当前页回执仍指向本批次某项（即使该项因失败/停止/清名录而清空了 swipe），依然识别出该项；
+ * 3) 若无批次或属于旧批次/无回执页，只要位于尾楼层且前一层是含 [[角色名]] 的提示词（或当前批次模板），
+ *    尝试从正文 YAML name: 提取角色名；截断得连名字都没有时返回 name: '' 供点击后弹窗确认。
+ */
+export function resolveRerollTarget(batch, chat, identity, { rosterNames = [], workNames = [] } = {}) {
+    if (!Array.isArray(chat) || chat.length < 2) return null;
+    const sameBatch = !!batch && batch.identity === identity;
+    const floor = sameBatch && Number.isInteger(batch.resultFloor) ? batch.resultFloor : chat.length - 1;
+    if (floor !== chat.length - 1 || floor < 1) return null;
+    const message = chat[floor];
+    if (!message || message.is_user || message.is_system) return null;
+    const index = message.swipe_id ?? 0;
+    const swipes = Array.isArray(message.swipes) && message.swipes.length ? message.swipes : [message.mes];
+    if (!Number.isInteger(index) || index < 0 || index >= swipes.length || typeof swipes[index] !== 'string')
+        return null;
+    const receipt = message.swipe_info?.[index]?.extra?.nag_role_batch ?? message.extra?.nag_role_batch;
+    if (receipt?.previewId) return null;
+
+    if (sameBatch) {
+        const strict = selectedRole(batch, message);
+        if (strict) return { floor, index, item: strict.item, name: strict.item.name, bound: true };
+        const candidates = [...(batch.items || []), ...(batch.history || [])];
+        if (receipt?.taskId === batch.id && receipt.itemId) {
+            const matched = candidates.filter((item) => item.id === receipt.itemId && item.name);
+            if (matched.length === 1) return { floor, index, item: matched[0], name: matched[0].name, bound: false };
+        }
+    }
+
+    const promptFloor = sameBatch && Number.isInteger(batch.promptFloor) ? batch.promptFloor : floor - 1;
+    const prompt = chat[promptFloor];
+    if (!prompt?.is_user || typeof prompt.mes !== 'string') return null;
+    const hasTemplate =
+        prompt.mes.includes('[[角色名]]') ||
+        (sameBatch && typeof batch.template === 'string' && batch.template.includes('[[角色名]]'));
+    if (!hasTemplate) return null;
+
+    const text = swipes[index];
+    const pool = sameBatch
+        ? [...(batch.items || []), ...(batch.history || [])]
+        : rosterNames.map((name) => ({ id: null, name }));
+    const byBody = matchRoleCardToCandidates(pool, text, workNames);
+    if (byBody.length === 1) {
+        return { floor, index, item: byBody[0].id ? byBody[0] : null, name: byBody[0].name, bound: false };
+    }
+    const extracted = extractRoleCardNames(text);
+    const inferredName = extracted.primaryNames[0] || extracted.allNames[0] || '';
+    return { floor, index, item: null, name: inferredName, bound: false };
+}
+
 /** Add one control to the native message and render the prompt as a view-only substitution. */
 const PREVIEW_BUTTONS = [
     ['compare', '⇄ 对比原版'],
@@ -23,7 +78,16 @@ const PREVIEW_BUTTONS = [
     ['discard', '✗ 放弃'],
 ];
 
-export function createRoleSelectionUI({ host, getBatch, isBusy, onReroll, onPreview = {}, notify = () => {} }) {
+export function createRoleSelectionUI({
+    host,
+    getBatch,
+    getRosterNames = () => [],
+    getWorkNames = () => [],
+    isBusy,
+    onReroll,
+    onPreview = {},
+    notify = () => {},
+}) {
     const context = host.getContext();
     const source = context?.eventSource;
     const subscriptions = [];
@@ -41,21 +105,29 @@ export function createRoleSelectionUI({ host, getBatch, isBusy, onReroll, onPrev
         const batch = getBatch(),
             chat = host.getChat(),
             identity = host.snapshot().identity;
-        const floor = batch?.resultFloor;
+        const sameBatch = !!batch && batch.identity === identity;
+        const resolved = resolveRerollTarget(batch, chat, identity, {
+            rosterNames: getRosterNames(),
+            workNames: getWorkNames(),
+        });
+        const floor = sameBatch && Number.isInteger(batch.resultFloor) ? batch.resultFloor : resolved?.floor;
         const message = Number.isInteger(floor) ? chat?.[floor] : null;
         const previewState =
-            batch?.preview && batch.identity === identity && batch.preview.floor === floor && host.rolePreview
+            batch?.preview && sameBatch && batch.preview.floor === floor && host.rolePreview
                 ? host.rolePreview(batch)
                 : null;
         const pendingPreview = !!previewState && chat?.length === floor + 1;
-        const bound = batch?.identity === identity ? selectedRole(batch, message) : null;
+        const bound = sameBatch ? selectedRole(batch, message) : null;
         // A displayed trial candidate shows its role name on the prompt, but is not a bound result.
         const selected =
             bound ||
             (previewState?.onCandidate
                 ? { item: { name: batch.preview.name }, index: previewState.displayed, preview: true }
-                : null);
-        const canReroll = !!bound && !pendingPreview && chat?.length === floor + 1;
+                : resolved?.name
+                  ? { item: { name: resolved.name }, index: resolved.index, loose: true }
+                  : null);
+        const canReroll =
+            !!(bound || resolved) && !pendingPreview && Number.isInteger(floor) && chat?.length === floor + 1;
         const document = globalThis.document;
         for (const button of document.querySelectorAll('.nag-reroll-role')) {
             if (!canReroll || button.closest('.mes')?.getAttribute('mesid') !== String(floor)) button.remove();
@@ -64,32 +136,39 @@ export function createRoleSelectionUI({ host, getBatch, isBusy, onReroll, onPrev
             if (!pendingPreview || button.closest('.mes')?.getAttribute('mesid') !== String(floor)) button.remove();
         }
         if (pendingPreview) renderPreviewButtons(floor, previewState);
-        if (!selected) {
+        if (!selected && !canReroll) {
             clearPrompt();
             return;
         }
-        const prompt = chat[batch.promptFloor];
-        const promptNode = document.querySelector(`#chat .mes[mesid="${batch.promptFloor}"]`);
-        if (!isBusy() && prompt?.is_user && prompt.mes === batch.template && !promptNode?.querySelector('textarea')) {
-            const sourceText =
-                typeof prompt.extra?.display_text === 'string' ? prompt.extra.display_text : batch.template;
-            if (!sourceText.includes('[[角色名]]')) clearPrompt();
+        const promptFloor = sameBatch && Number.isInteger(batch.promptFloor) ? batch.promptFloor : floor - 1;
+        const prompt = chat?.[promptFloor];
+        const promptNode = document.querySelector(`#chat .mes[mesid="${promptFloor}"]`);
+        const template = sameBatch ? batch.template : prompt?.mes;
+        if (
+            selected?.item?.name &&
+            !isBusy() &&
+            prompt?.is_user &&
+            prompt.mes === template &&
+            !promptNode?.querySelector('textarea')
+        ) {
+            const sourceText = typeof prompt.extra?.display_text === 'string' ? prompt.extra.display_text : template;
+            if (!sourceText?.includes('[[角色名]]')) clearPrompt();
             else {
                 const display = sourceText.replaceAll('[[角色名]]', () => selected.item.name);
                 if (
-                    lastPrompt?.floor !== batch.promptFloor ||
+                    lastPrompt?.floor !== promptFloor ||
                     lastPrompt?.name !== selected.item.name ||
                     lastPrompt?.original !== prompt ||
                     lastPrompt?.node !== promptNode ||
                     lastPrompt?.sourceText !== sourceText
                 ) {
-                    context.updateMessageBlock(batch.promptFloor, {
+                    context.updateMessageBlock(promptFloor, {
                         ...prompt,
                         extra: { ...prompt.extra, display_text: display },
                     });
                     lastPrompt = {
                         identity,
-                        floor: batch.promptFloor,
+                        floor: promptFloor,
                         original: prompt,
                         name: selected.item.name,
                         node: promptNode,
@@ -113,7 +192,7 @@ export function createRoleSelectionUI({ host, getBatch, isBusy, onReroll, onPrev
             container.appendChild(button);
         }
         button.textContent = '↻ 重生成此角色';
-        button.title = `重新生成 ${selected.item.name}`;
+        button.title = selected?.item?.name ? `重新生成 ${selected.item.name}` : '重新生成当前备选页（点击输入角色名）';
         button.disabled = isBusy();
     }
     function renderPreviewButtons(floor, { preview, candidates, onCandidate }) {

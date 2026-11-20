@@ -859,6 +859,7 @@ it('auditReplies marks falsely completed truncated replies as failed, removes th
         archiveRemoved: 1,
         archiveAdded: 1,
         nameMismatches: 1,
+        adoptedCount: 0,
     });
     expect(settings.roleBatch.items[0]).toMatchObject({
         failed: true,
@@ -959,4 +960,116 @@ it('restore-origin keeps a parked or failed role in its original slot while rest
     runner.editQueue('restore', qin.id);
     expect(settings.roleBatch.items.map((item) => item.name)).toEqual(['安柏', '丽莎', '琴']);
     expect(settings.roleBatch.items[2]).toMatchObject({ name: '琴', parked: false });
+});
+
+it('allows restoring parked roles even when a stopped batch still has pending=true for another item', () => {
+    const settings = {
+        roleNames: '琴\n安柏',
+        roleArchive: [],
+        roleBatch: {
+            id: 'task-1',
+            identity: 'chat-1',
+            promptFloor: 1,
+            resultFloor: 2,
+            template: '生成 [[角色名]]',
+            names: ['琴', '安柏'],
+            index: 1,
+            pending: true,
+            dispatch: { itemId: 'r2', attemptId: 'att-1' },
+            items: [
+                { id: 'r1', name: '琴', failed: true, parked: true },
+                { id: 'r2', name: '安柏', processing: false },
+            ],
+            history: [],
+        },
+    };
+    const runner = createRoleBatchRunner({
+        getSettings: () => settings,
+        host: { snapshot: () => ({ identity: 'chat-1', generating: false, connected: true }) },
+        onChange: vi.fn(),
+        notify: vi.fn(),
+        onStats: vi.fn(),
+    });
+    runner.editQueue('restore-origin', 'r1');
+    expect(settings.roleBatch.items[0]).toMatchObject({ id: 'r1', parked: false });
+    settings.roleBatch.items[0].parked = true;
+    expect(runner.restoreAllParked()).toBe(1);
+    expect(settings.roleBatch.items.map((item) => item.name)).toEqual(['安柏', '琴']);
+});
+
+it('auditReplies adopts unbound complete replies whose YAML name includes an English gloss (e.g. 胜利（Victory）)', async () => {
+    const settings = {
+        roleNames: '胜利\n胡德',
+        roleArchive: [],
+        roleBatch: {
+            id: 'task-1',
+            identity: 'chat-1',
+            promptFloor: 1,
+            resultFloor: 2,
+            template: '生成 [[角色名]]',
+            names: ['胜利', '胡德'],
+            index: 0,
+            items: [
+                { id: 'r1', name: '胜利' },
+                { id: 'r2', name: '胡德' },
+            ],
+            history: [],
+        },
+    };
+    const onRoleComplete = (name) => {
+        if (!settings.roleArchive.includes(name)) settings.roleArchive.push(name);
+    };
+    const bindRoleReply = vi.fn(async () => true);
+    const runner = createRoleBatchRunner({
+        getSettings: () => settings,
+        host: {
+            snapshot: () => ({ identity: 'chat-1', generating: false, connected: true }),
+            auditRoleBatch: vi.fn(async () => []),
+            scanUnboundRoleReplies: vi.fn(async () => [
+                {
+                    swipe: 0,
+                    text: '```\n[start]\n<character_design_complex>\nname: 胜利（Victory）\n</character_design_complex>\n[end]\n```',
+                    truncated: false,
+                    tokenCount: 6000,
+                },
+            ]),
+            bindRoleReply,
+        },
+        onChange: vi.fn(),
+        notify: vi.fn(),
+        onStats: vi.fn(),
+        onRoleComplete,
+        onRoleArchiveChange: vi.fn(),
+    });
+    const summary = await runner.auditReplies();
+    expect(summary.adoptedCount).toBe(1);
+    expect(bindRoleReply).toHaveBeenCalledWith(settings.roleBatch, 'r1', 0);
+    expect(settings.roleBatch.items[0]).toMatchObject({ processed: true, failed: false, parked: false, swipe: 0 });
+    expect(settings.roleArchive).toEqual(['胜利']);
+});
+
+it('manual generateOne generates only one next role or one explicitly picked role without chaining', async () => {
+    vi.useFakeTimers();
+    const { settings, host, runner } = setup([
+        { text: '完成琴', swipe: 0 },
+        { text: '完成丽莎', swipe: 1 },
+    ]);
+    settings.roleNames = '琴\n安柏\n丽莎';
+    // 手动生成下一个：只生成琴就停，不连跑安柏
+    const one = runner.generateOne();
+    await vi.runAllTimersAsync();
+    await one;
+    expect(host.generateRoleReply).toHaveBeenCalledTimes(1);
+    expect(settings.roleBatch.items[0]).toMatchObject({ name: '琴', processed: true, failed: false });
+    expect(settings.roleBatch.items[1].processed).toBeFalsy();
+
+    // 手动指定生成丽莎：跳过安柏直接单步生成丽莎
+    const lisaId = settings.roleBatch.items[2].id;
+    const picked = runner.generateOne({ id: lisaId, name: '丽莎' });
+    await vi.runAllTimersAsync();
+    await picked;
+    expect(host.generateRoleReply).toHaveBeenCalledTimes(2);
+    expect(host.generateRoleReply.mock.calls[1][1]).toContain('丽莎');
+    expect(settings.roleBatch.items[2]).toMatchObject({ name: '丽莎', processed: true, failed: false });
+    expect(settings.roleBatch.items[1].processed).toBeFalsy();
 });

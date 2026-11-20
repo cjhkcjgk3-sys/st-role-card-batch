@@ -416,3 +416,21 @@ export function detectRoleCardNameMismatch(expectedName, text, workNames = []) {
     const found = primaryNames[0] || allNames[0];
     return `备选页角色名为「${found}」，与名单「${target}」不符，请核对`;
 }
+
+/**
+ * 从候选角色项中按正文 YAML name/nicknames 匹配对应的角色项列表。
+ * 使用与名录/图片相同的名称匹配规则；正文无有效 name 字段时返回空数组。
+ */
+export function matchRoleCardToCandidates(candidates, text, workNames = []) {
+    if (!Array.isArray(candidates) || !candidates.length || typeof text !== 'string' || !text.trim()) return [];
+    const { allNames } = extractRoleCardNames(text);
+    if (!allNames.length) return [];
+    const cardMatcher = createRoleNameMatcher(allNames, workNames);
+    return candidates.filter((item) => {
+        const name = String(item?.name || '').trim();
+        if (!name) return false;
+        if (cardMatcher.has(name)) return true;
+        const itemMatcher = createRoleNameMatcher([name], workNames);
+        return allNames.some((candidate) => itemMatcher.has(candidate));
+    });
+}

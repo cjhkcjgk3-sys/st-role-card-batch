@@ -48,6 +48,161 @@ export function parseRoleImageName(value, workNames = []) {
     return parseWithWorkKeys(value, workKeysOf(workNames));
 }
 
+const HAS_HAN_RE = /[\u3400-\u4dbf\u4e00-\u9fff]/;
+const HAS_FOREIGN_RE = /[a-z\u3040-\u30ff\uac00-\ud7af]/;
+const PURE_NUMBER_OR_MODEL_RE = /^(?:\d+|(?:v|ver|mk|type|no)\d+[a-z]?)$/i;
+
+/** 明确的英文形态、职阶、稀有度与编号后缀：不能当作外文原名注释丢掉。 */
+const FOREIGN_FORM_TOKENS = new Set([
+    'meta',
+    'alter',
+    'lily',
+    'proto',
+    'kai',
+    'kai2',
+    'kaini',
+    'zwei',
+    'drei',
+    'eins',
+    'muse',
+    'u',
+    'μ',
+    'terror',
+    'sp',
+    'ex',
+    'dx',
+    'hd',
+    'pro',
+    'plus',
+    'zero',
+    'origin',
+    'prime',
+    'summer',
+    'winter',
+    'spring',
+    'autumn',
+    'xmas',
+    'christmas',
+    'halloween',
+    'bride',
+    'wedding',
+    'maid',
+    'bunny',
+    'idol',
+    'swimsuit',
+    'dress',
+    'casual',
+    'uniform',
+    'skin',
+    'costume',
+    'retrofit',
+    'mod',
+    'ver',
+    'version',
+    'type',
+    'mark',
+    'mk',
+    'saber',
+    'lancer',
+    'archer',
+    'rider',
+    'caster',
+    'assassin',
+    'berserker',
+    'ruler',
+    'avenger',
+    'mooncancer',
+    'foreigner',
+    'pretender',
+    'shielder',
+    'beast',
+    'alterego',
+    's',
+    'a',
+    'b',
+    'c',
+    'd',
+    'e',
+    'r',
+    'sr',
+    'ssr',
+    'ur',
+    'lr',
+    'n',
+    'i',
+    'ii',
+    'iii',
+    'iv',
+    'v',
+    'vi',
+    'vii',
+    'viii',
+    'ix',
+    'x',
+]);
+
+/** 常见中文形态/服装后缀：外文名带这些括号（如 Saber（泳装））时不能把括号内容当成中文译名。 */
+const CJK_FORM_NOTES = new Set([
+    '改',
+    '改造',
+    '二改',
+    '三改',
+    '泳装',
+    '水着',
+    '皮肤',
+    '换装',
+    '私服',
+    '常服',
+    '校服',
+    '礼服',
+    '正月',
+    '圣诞',
+    '万圣节',
+    '兔女郎',
+    '女仆',
+    '女仆装',
+    '偶像',
+    '花嫁',
+    '婚纱',
+    '觉醒',
+    '黑化',
+    '幼女',
+    '兵装',
+    '律者',
+    '形态',
+    '立绘',
+    '初始',
+    '本体',
+    '原型',
+    '应援团',
+    '旗袍',
+    '和服',
+    '浴衣',
+    '睡衣',
+    '赛车',
+    '运动服',
+    '体操服',
+]);
+
+function isForeignFormGroup(rawGroup, compactGroup) {
+    if (compactGroup.length <= 1) return true;
+    const tokens = String(rawGroup || '')
+        .split(/[\p{P}\p{S}\p{Z}\s]+/u)
+        .filter(Boolean);
+    if (!tokens.length) return true;
+    return tokens.every((token) => FOREIGN_FORM_TOKENS.has(token) || PURE_NUMBER_OR_MODEL_RE.test(token));
+}
+
+function isForeignGlossForHanRole(rawGroup, compactGroup) {
+    if (!compactGroup || HAS_HAN_RE.test(compactGroup) || !HAS_FOREIGN_RE.test(compactGroup)) return false;
+    return !isForeignFormGroup(rawGroup, compactGroup);
+}
+
+function isHanGlossForForeignRole(compactGroup) {
+    if (!compactGroup || !HAS_HAN_RE.test(compactGroup)) return false;
+    return !CJK_FORM_NOTES.has(compactGroup);
+}
+
 export function parseWithWorkKeys(value, workKeys) {
     const text = unifyName(value);
     let outside = '';
@@ -69,9 +224,9 @@ export function parseWithWorkKeys(value, workKeys) {
     }
     if (depth > 0) outside += current;
     const workSet = new Set(workKeys);
-    const compactGroups = groups.map(compact);
-    const notes = compactGroups.filter((note) => note && !workSet.has(note));
-    let work = compactGroups.find((note) => workSet.has(note)) || '';
+    const groupEntries = groups.map((raw) => ({ raw, key: compact(raw) })).filter((entry) => entry.key);
+    let work = groupEntries.find((entry) => workSet.has(entry.key))?.key || '';
+    const nonWorkGroups = groupEntries.filter((entry) => !workSet.has(entry.key));
     let role = compact(outside);
     for (const key of workKeys) {
         if (role.length > key.length && role.startsWith(key)) {
@@ -84,6 +239,21 @@ export function parseWithWorkKeys(value, workKeys) {
         work ||= role;
         role = '';
     }
+    const notes = [];
+    const roleHasHan = HAS_HAN_RE.test(role);
+    const roleIsForeign = !roleHasHan && HAS_FOREIGN_RE.test(role);
+    let promotedHanRole = '';
+    for (const entry of nonWorkGroups) {
+        if (roleHasHan && isForeignGlossForHanRole(entry.raw, entry.key)) {
+            continue;
+        }
+        if (roleIsForeign && !promotedHanRole && isHanGlossForForeignRole(entry.key)) {
+            promotedHanRole = entry.key;
+            continue;
+        }
+        notes.push(entry.key);
+    }
+    if (promotedHanRole) role = promotedHanRole;
     if (!role && notes.length) role = notes.shift();
     return { role, notes, key: role + notes.join(''), work };
 }
@@ -102,15 +272,19 @@ export function createRoleNameMatcher(names, workNames = []) {
     const workKeys = workKeysOf(workNames);
     const byKey = new Map();
     const reversedNames = new Set();
+    const addReversed = (str) => {
+        if (str.length > 1) reversedNames.add(reverseName(str));
+    };
     for (const raw of Array.isArray(names) ? names : []) {
         const name = String(raw ?? '').trim();
         if (!name) continue;
         const parsed = parseWithWorkKeys(name, workKeys);
-        const compactName = compact(name);
-        if (compactName.length > 1) reversedNames.add(reverseName(compactName));
-        if (!parsed.key) continue;
-        if (!byKey.has(parsed.key)) byKey.set(parsed.key, new Set());
-        byKey.get(parsed.key).add(parsed.work);
+        addReversed(compact(name));
+        if (parsed.key) {
+            addReversed(parsed.key);
+            if (!byKey.has(parsed.key)) byKey.set(parsed.key, new Set());
+            byKey.get(parsed.key).add(parsed.work);
+        }
     }
     // A suffix of a name becomes a prefix of its reversal. Store one string per name,
     // rather than allocating every suffix (quadratic character storage for long names).
@@ -132,12 +306,13 @@ export function createRoleNameMatcher(names, workNames = []) {
             const name = String(value ?? '').trim();
             if (!name) return;
             const parsed = parseWithWorkKeys(name, workKeys);
-            const compactName = compact(name);
-            if (compactName.length > 1) {
-                const reversed = reverseName(compactName);
-                if (!reversedNames.has(reversed)) {
-                    reversedNames.add(reversed);
-                    insertSorted(reversed);
+            for (const candidate of [compact(name), parsed.key]) {
+                if (candidate && candidate.length > 1) {
+                    const reversed = reverseName(candidate);
+                    if (!reversedNames.has(reversed)) {
+                        reversedNames.add(reversed);
+                        insertSorted(reversed);
+                    }
                 }
             }
             if (!parsed.key) return;
@@ -150,18 +325,29 @@ export function createRoleNameMatcher(names, workNames = []) {
             if (!name) return false;
             const parsed = parseWithWorkKeys(name, workKeys);
             const works = byKey.get(parsed.key);
-            if (works && (!parsed.work || works.has('') || works.has(parsed.work))) return true;
-            const target = compact(name);
-            if (target.length < 2) return false;
-            const reversed = reverseName(target);
-            let low = 0;
-            let high = sortedNames.length;
-            while (low < high) {
-                const middle = low + Math.floor((high - low) / 2);
-                if (sortedNames[middle] < reversed) low = middle + 1;
-                else high = middle;
+            if (works) {
+                if (!parsed.work || works.has('') || works.has(parsed.work)) return true;
+                // 同角色名但明确属于不同作品，直接返回 false，不再落入后缀回退。
+                return false;
             }
-            return sortedNames[low]?.startsWith(reversed) ?? false;
+            const compactTarget = compact(name);
+            const candidates =
+                !parsed.work && parsed.key && parsed.key !== compactTarget
+                    ? [parsed.key, compactTarget]
+                    : [compactTarget];
+            for (const target of candidates) {
+                if (target.length < 2) continue;
+                const reversed = reverseName(target);
+                let low = 0;
+                let high = sortedNames.length;
+                while (low < high) {
+                    const middle = low + Math.floor((high - low) / 2);
+                    if (sortedNames[middle] < reversed) low = middle + 1;
+                    else high = middle;
+                }
+                if (sortedNames[low]?.startsWith(reversed)) return true;
+            }
+            return false;
         },
     };
 }

@@ -80,6 +80,8 @@ export function initNovelUI(host) {
         isolateRoleResult: false,
         // 单角色重生成先在末尾生成候选版本，由用户确认后才替换原页；关闭则生成完成后自动替换。
         rerollConfirm: true,
+        // 手动模式：关闭连跑，按需单步生成下一个或点击任意角色行单独生成，与自动批量随心切换。
+        manualMode: false,
         bufferModelStream: false,
 
         // 导出设置
@@ -115,7 +117,7 @@ export function initNovelUI(host) {
     let progressCountCache = null;
     let duplicateNamesCache = null;
     let unknownPagesCache = null;
-    const pluginVersion = '2.0.8';
+    const pluginVersion = '2.1.0';
     function invalidateRoleArchive() {
         archiveRevision++;
         archiveMatcherCache = null;
@@ -680,8 +682,9 @@ export function initNovelUI(host) {
         return { processing: '⏳', failed: '❌', complete: '✅', queued: '⏳' }[status] || '⏳';
     }
 
-    async function startGeneration() {
+    async function startGeneration(singleTarget = null) {
         if (fileOperation) return;
+        const target = singleTarget && (singleTarget.id || singleTarget.name) ? singleTarget : null;
         commitRosterInput();
         try {
             if (settings.bufferModelStream) await bufferedStream.probe();
@@ -694,6 +697,8 @@ export function initNovelUI(host) {
         const currentPrompt = $('#nag-set-prompt').val();
         if (typeof currentPrompt === 'string') settings.roleNames = currentPrompt;
         roleRunner.saveInput();
+        if (target) return roleRunner.generateOne(target);
+        if (settings.manualMode) return roleRunner.generateOne();
         return roleRunner.start();
     }
     async function rerollCurrentRole() {
@@ -1454,12 +1459,13 @@ export function initNovelUI(host) {
         $('#nag-role-results').toggle(batchMode);
         const visibleIndices = roleNames.map((_, index) => index).filter((index) => !batch?.items[index]?.parked);
         const parked = (batch?.items || []).filter((item) => item.parked);
+        const manualMode = Boolean(settings.manualMode);
         $('#nag-parked-count').text(`（${parked.length}）`);
         $('#nag-parked-restore-all').prop('disabled', !parked.length || fileOperation);
         $('#nag-parked-copy').prop('disabled', !parked.length);
-        const parkedKey = parked
+        const parkedKey = `${manualMode ? 1 : 0}:${busy ? 1 : 0}|${parked
             .map((item) => `${item.id}:${item.name}:${item.failed ? 1 : 0}:${item.error || ''}`)
-            .join('\u0000');
+            .join('\u0000')}`;
         if (parkedKey !== renderedParkedKey) {
             renderedParkedKey = parkedKey;
             $('#nag-parked-list').html(
@@ -1469,7 +1475,10 @@ export function initNovelUI(host) {
                         const reason = item.error
                             ? ` <span class="nag-role-failure" data-id="${escapeAttribute(item.id)}" title="${escapeAttribute(item.error)}">⚠</span>`
                             : '';
-                        return `<div class="nag-role-status-row"><span class="nag-role-status-name">${icon} ${escapeHtml(item.name)}${reason}</span><span class="nag-role-row-controls"><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="restore-origin">放回原处</button><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="restore">放回队尾</button></span></div>`;
+                        const manualBtn = manualMode
+                            ? `<button type="button" class="menu_button nag-manual-gen" data-id="${escapeAttribute(item.id)}" data-name="${escapeAttribute(item.name)}" title="手动单独生成 ${escapeAttribute(item.name)}"${busy ? ' disabled' : ''}>生成</button>`
+                            : '';
+                        return `<div class="nag-role-status-row"><span class="nag-role-status-name">${icon} ${escapeHtml(item.name)}${reason}</span><span class="nag-role-row-controls">${manualBtn}<button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="restore-origin" title="放回原来的名单位置">原处</button><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="restore" title="放回队尾集中生成">队尾</button></span></div>`;
                     })
                     .join('') || '<small class="nag-hint">没有暂移角色</small>',
             );
@@ -1498,7 +1507,12 @@ export function initNovelUI(host) {
                   const queueControls = queueEligible
                       ? `<details class="nag-queue-menu"><summary>操作</summary><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="top">置顶</button><button type="button" class="menu_button nag-queue-action" data-id="${escapeAttribute(item.id)}" data-action="park">暂移</button></details><button type="button" class="menu_button nag-queue-drag" data-id="${escapeAttribute(item.id)}" aria-label="长按拖动排序">☰</button>`
                       : '';
+                  const manualBtn =
+                      manualMode && !item.processing
+                          ? `<button type="button" class="menu_button nag-manual-gen" data-id="${escapeAttribute(item.id || '')}" data-name="${escapeAttribute(name)}" title="手动单独生成 ${escapeAttribute(name)}"${busy ? ' disabled' : ''}>生成</button>`
+                          : '';
                   const controls =
+                      manualBtn +
                       queueControls +
                       (roleCorrection && item.id
                           ? `<span class="nag-role-correction-actions"><button type="button" class="menu_button nag-role-status-set" data-index="${index}" data-status="complete">✓ 完成</button><button type="button" class="menu_button nag-role-status-set" data-index="${index}" data-status="failed">✗ 失败</button><button type="button" class="menu_button nag-role-status-set" data-index="${index}" data-status="auto">自动</button></span>`
@@ -1535,12 +1549,16 @@ export function initNovelUI(host) {
             : ['⏹️ 已停止', 'stopped'];
         $('#nag-status').text(txt).removeClass('stopped paused running').addClass(cls);
 
+        $('#nag-mode-auto').toggleClass('is-active', !manualMode).prop('disabled', busy);
+        $('#nag-mode-manual').toggleClass('is-active', manualMode).prop('disabled', busy);
         $('#nag-btn-start').prop('disabled', busy);
-        $('#nag-btn-pause').prop('disabled', !settings.isRunning || settings.isPaused);
-        $('#nag-btn-resume').prop('disabled', !settings.isPaused);
+        $('#nag-btn-pause')
+            .toggle(!manualMode)
+            .prop('disabled', !settings.isRunning || settings.isPaused);
+        $('#nag-btn-resume').toggle(!manualMode).prop('disabled', !settings.isPaused);
         $('#nag-btn-stop').prop('disabled', !settings.isRunning);
         $('#nag-btn-reset').prop('disabled', busy);
-        $('#nag-btn-start').text(batchMode ? '▶️ 开始／继续' : '▶️ 开始');
+        $('#nag-btn-start').text(manualMode ? '▶️ 生成下一个' : batchMode ? '▶️ 开始／继续' : '▶️ 开始');
         $('#nag-btn-reset').text(batchMode ? '🔄 重置（保留已完成）' : '🔄 重置');
         $('#nag-btn-restart-role').toggle(batchMode).prop('disabled', busy);
 
@@ -1613,6 +1631,10 @@ export function initNovelUI(host) {
                 </div>
                 
                 <div class="nag-section nag-controls">
+                    <div class="nag-btn-row nag-mode-switch" role="group" aria-label="生成模式切换">
+                        <button type="button" id="nag-mode-auto" class="menu_button is-active">🤖 自动批量</button>
+                        <button type="button" id="nag-mode-manual" class="menu_button">✋ 手动生成</button>
+                    </div>
                     <div class="nag-btn-row">
                         <button id="nag-btn-start" class="menu_button">▶️ 开始</button>
                         <button id="nag-btn-pause" class="menu_button" disabled>⏸️ 暂停</button>
@@ -2026,6 +2048,25 @@ export function initNovelUI(host) {
                 toastr.warning(error.message);
             }
         });
+        $('#nag-mode-auto').on('click', () => {
+            if (settings.isRunning || fileOperation || !settings.manualMode) return;
+            settings.manualMode = false;
+            saveSettings();
+            updateUI();
+        });
+        $('#nag-mode-manual').on('click', () => {
+            if (settings.isRunning || fileOperation || settings.manualMode) return;
+            settings.manualMode = true;
+            saveSettings();
+            updateUI();
+        });
+        $('#nag-role-results, #nag-parked-list').on('click', '.nag-manual-gen', function () {
+            if (settings.isRunning || fileOperation) return;
+            const id = this.dataset.id || null;
+            const name = this.dataset.name || null;
+            if (!id && !name) return;
+            void startGeneration({ id, name });
+        });
         $('#nag-role-results, #nag-parked-list').on('click', '.nag-queue-action', function () {
             try {
                 roleRunner.editQueue(this.dataset.action, this.dataset.id);
@@ -2119,7 +2160,9 @@ export function initNovelUI(host) {
             settings.bufferModelStream = Boolean(this.checked);
             saveSettings();
         });
-        $('#nag-btn-start').on('click', startGeneration);
+        $('#nag-btn-start').on('click', () => {
+            void startGeneration();
+        });
         $('#nag-btn-pause').on('click', pauseGeneration);
         $('#nag-btn-resume').on('click', resumeGeneration);
         $('#nag-btn-stop').on('click', stopGeneration);
@@ -2563,6 +2606,8 @@ export function initNovelUI(host) {
         roleSelection = createRoleSelectionUI({
             host,
             getBatch: () => (settings.generationMode === 'role-batch' ? settings.roleBatch : null),
+            getRosterNames: () => parseRoleNames(settings.roleNames),
+            getWorkNames: () => settings.roleImageLibrary?.workNames || [],
             isBusy: () => settings.isRunning || fileOperation,
             onReroll: rerollCurrentRole,
             onPreview: {

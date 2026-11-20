@@ -302,6 +302,21 @@ export function extractRoleCardNames(text) {
             }
         }
     }
-    const allNames = [...new Set([...primaryNames, ...nicknames])];
+    const extraNames = [];
+    for (const primary of primaryNames) {
+        const glossMatch = primary.match(/[(（]([^()（）]+)[)）]/g);
+        if (!glossMatch) continue;
+        for (const segment of glossMatch) {
+            const inner = cleanCardScalar(segment.slice(1, -1));
+            if (
+                inner &&
+                !/[\u3400-\u4dbf\u4e00-\u9fff]/.test(inner) &&
+                /[a-zA-Z\u3040-\u30ff\uac00-\ud7af]{2,}/.test(inner)
+            ) {
+                extraNames.push(inner);
+            }
+        }
+    }
+    const allNames = [...new Set([...primaryNames, ...nicknames, ...extraNames])];
     return { primaryNames, nicknames, allNames };
 }

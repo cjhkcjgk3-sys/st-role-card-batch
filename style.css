@@ -781,7 +781,34 @@
 }
 
 .nag-role-row-controls {
-    flex: 0 1 auto;
+    display: inline-flex;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 4px;
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
+.nag-role-row-controls .menu_button {
+    width: auto;
+    min-width: 0;
+    margin: 0;
+    padding: 3px 7px;
+    font-size: 12px;
+    line-height: 1.3;
+    white-space: nowrap;
+}
+
+.nag-mode-switch {
+    margin-bottom: 6px;
+}
+
+.nag-mode-switch .menu_button.is-active {
+    border-color: #8bc34a;
+    background: rgba(139, 195, 74, 0.22);
+    color: #fff;
+    font-weight: 600;
 }
 
 .nag-role-image-slot {
@@ -828,7 +855,10 @@
 .nag-role-checklist-list {
     border-radius: 6px;
     background: rgba(0, 0, 0, 0.15);
-    max-height: min(50vh, 360px);
+    height: min(40vh, 260px);
+    min-height: 100px;
+    max-height: 75vh;
+    resize: vertical;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
     overscroll-behavior: contain;
@@ -1250,7 +1280,10 @@
    ============================================ */
 
 .nag-archive-list {
-    max-height: 220px;
+    height: 220px;
+    min-height: 100px;
+    max-height: 75vh;
+    resize: vertical;
     overflow-y: auto;
     margin: 6px 0;
     border-radius: 6px;
@@ -1287,10 +1320,18 @@
     cursor: pointer;
 }
 
-/* 角色名单列表的容器与行（原先借自 txtToWorldbook 的样式，独立后收回到这里） */
+/* 角色名单列表的容器与行（与上方角色名单输入框一致，支持右下角上下拖拽调整高度） */
 .ttw-memory-queue {
-    max-height: 200px;
+    height: 220px;
+    min-height: 100px;
+    max-height: 75vh;
+    resize: vertical;
     overflow-y: auto;
+}
+
+#nag-parked-list.ttw-memory-queue {
+    height: 160px;
+    min-height: 80px;
 }
 
 .ttw-memory-item {

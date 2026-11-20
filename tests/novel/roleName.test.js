@@ -107,4 +107,25 @@ describe('createRoleNameMatcher', () => {
         for (const query of ['角色0号', '角色4999号', '角色5000号', '作品丙同名', '作品乙同名', '同名', '不存在'])
             expect(matcher.has(query), query).toBe(previous(query));
     });
+
+    it('matches Chinese names with parenthesized foreign glosses symmetrically while preserving real form suffixes', () => {
+        const matcher = createRoleNameMatcher([
+            '胜利（Victory）',
+            '碧蓝航线·胡德（HMS Hood）',
+            '雷电芽衣（Raiden Mei）（雷之律者）',
+        ]);
+        expect(matcher.has('胜利')).toBe(true);
+        expect(matcher.has('胜利 (HMS Victorious)')).toBe(true);
+        expect(matcher.has('Victory（胜利）')).toBe(true);
+        expect(matcher.has('胡德')).toBe(true);
+        expect(matcher.has('雷电芽衣（雷之律者）')).toBe(true);
+        expect(matcher.has('雷电芽衣')).toBe(false);
+
+        const reverse = createRoleNameMatcher(['胜利', '长门', '亚瑟', '约克城']);
+        expect(reverse.has('胜利（Victory）')).toBe(true);
+        expect(reverse.has('Victory（胜利）')).toBe(true);
+        expect(reverse.has('长门（META）')).toBe(false);
+        expect(reverse.has('亚瑟（Alter）')).toBe(false);
+        expect(reverse.has('约克城（II）')).toBe(false);
+    });
 });

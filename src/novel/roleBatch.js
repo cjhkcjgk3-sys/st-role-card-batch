@@ -5,6 +5,7 @@ import {
     applyRoleArchiveChanges,
     detectRoleCardNameMismatch,
     hydrateRoleBatch,
+    matchRoleCardToCandidates,
     nextRoleIndex,
     normalizeRoleArchive,
     removeRoleArchiveMatches,
@@ -152,12 +153,18 @@ export function createRoleBatchRunner({
             throw error;
         }
     }
-    async function start() {
+    async function start({ singleStep = false, targetItemId = null, targetName = null } = {}) {
         if (active || preparing) return;
         preparing = true;
         const settings = getSettings();
         const initial = host.snapshot();
-        const run = { identity: initial.identity, controller: new AbortController(), paused: false, queueRun: true };
+        const isManualOne = Boolean(singleStep || targetItemId || targetName);
+        const run = {
+            identity: initial.identity,
+            controller: new AbortController(),
+            paused: false,
+            queueRun: !isManualOne,
+        };
         active = run;
         settings.isRunning = true;
         settings.isPaused = false;
@@ -165,6 +172,7 @@ export function createRoleBatchRunner({
         onStats(stats);
         onChange();
         let ready = false;
+        let explicitTargetIndex = -1;
         try {
             restore();
             if (initial.identity == null || initial.generating === true)
@@ -209,13 +217,20 @@ export function createRoleBatchRunner({
             batch.inputNames = settings.roleNames;
             batch.inputLimit = settings.totalChapters;
             const archivedSkips = applyArchiveSkips(batch, settings.roleArchive, settings.roleImageLibrary?.workNames);
-            if (archivedSkips.length)
+            if (archivedSkips.length && !targetItemId && !targetName)
                 notify(
                     'info',
                     `名录中已有 ${archivedSkips.length} 个角色，本次跳过：${archivedSkips.slice(0, 5).join('、')}${archivedSkips.length > 5 ? '…' : ''}；要重新生成请先在名录中删除。`,
                 );
+            if (targetItemId || targetName) {
+                explicitTargetIndex = batch.items.findIndex(
+                    (item) => (targetItemId && item.id === targetItemId) || (targetName && item.name === targetName),
+                );
+                if (explicitTargetIndex < 0) throw new Error('找不到要生成的角色，请先核对名单');
+                batch.index = explicitTargetIndex;
+            }
             checkpoint();
-            if (batch.index >= batch.names.length) {
+            if (explicitTargetIndex < 0 && batch.index >= batch.names.length) {
                 notify('info', '名单已全部完成，已有成品与名录条目已跳过；需要重做请先从“已完成角色名录”删除对应名字');
                 return;
             }
@@ -244,13 +259,15 @@ export function createRoleBatchRunner({
         try {
             const batch = state();
             let recoveryFailures = 0;
+            let processedInRun = 0;
             while (batch.index < batch.names.length) {
                 while (run.paused) {
                     await abortableDelay(100, run.controller.signal);
                     assertCurrent(run);
                 }
                 assertCurrent(run);
-                if (batch.items[batch.index].parked || roleComplete(batch.items[batch.index])) {
+                const isExplicit = explicitTargetIndex === batch.index;
+                if (!isExplicit && (batch.items[batch.index].parked || roleComplete(batch.items[batch.index]))) {
                     batch.index++;
                     continue;
                 }
@@ -302,11 +319,21 @@ export function createRoleBatchRunner({
                     if (!truncated) onRoleComplete(batch.items[batch.index].name);
                     if (nameWarning) notify('warning', `${name}：${nameWarning}`);
                     if (truncated) stats.errors.push({ chapter: batch.index + 1, error: failureReason });
-                    batch.index++;
+                    batch.index = isExplicit ? nextRoleIndex(batch) : batch.index + 1;
                     batch.dispatch = null;
                     stats.chaptersGenerated++;
                     stats.totalCharacters += reply.text?.length || 0;
+                    processedInRun++;
                     checkpoint();
+                    if (isManualOne) {
+                        notify(
+                            truncated ? 'warning' : 'success',
+                            truncated
+                                ? `「${name}」未通过完整校验（${failureReason}），已移至「暂移角色」`
+                                : `「${name}」已生成完成`,
+                        );
+                        break;
+                    }
                 } catch (error) {
                     assertCurrent(run);
                     if (error.code === 'CHECKPOINT_FAILED') throw error;
@@ -329,9 +356,10 @@ export function createRoleBatchRunner({
                         error: error.message,
                     };
                     const recoverableStop =
-                        error.code === 'GENERATION_TIMEOUT' ||
-                        error.code === 'NOT_CONNECTED' ||
-                        error.phase === 'select-swipe';
+                        !isManualOne &&
+                        (error.code === 'GENERATION_TIMEOUT' ||
+                            error.code === 'NOT_CONNECTED' ||
+                            error.phase === 'select-swipe');
                     if (recoverableStop) {
                         let recovered = false;
                         while (!recovered && recoveryFailures < 3) {
@@ -366,14 +394,21 @@ export function createRoleBatchRunner({
                     if (roleComplete(batch.items[batch.index])) {
                         batch.items[batch.index].parked = false;
                         onRoleComplete(name);
-                        notify('info', `${name}：已恢复并确认生成结果，继续下一个角色`);
+                        notify('info', `${name}：已恢复并确认生成结果${isManualOne ? '' : '，继续下一个角色'}`);
                     } else {
                         stats.errors.push({ chapter: batch.index + 1, error: error.message });
-                        notify('warning', `${name}：生成失败，已移至「暂移角色」并继续下一个`);
+                        notify(
+                            'warning',
+                            isManualOne
+                                ? `${name}：生成失败（${error.message}），已移至「暂移角色」`
+                                : `${name}：生成失败，已移至「暂移角色」并继续下一个`,
+                        );
                     }
-                    batch.index++;
+                    batch.index = isExplicit ? nextRoleIndex(batch) : batch.index + 1;
                     batch.dispatch = null;
+                    processedInRun++;
                     checkpoint();
+                    if (isManualOne) break;
                 }
                 let hasNextRole = false;
                 for (let i = batch.index; i < batch.items.length; i++) {
@@ -388,16 +423,22 @@ export function createRoleBatchRunner({
                         run.controller.signal,
                     );
             }
-            const remaining = batch.items.filter((item) => !item.parked && !roleComplete(item)).length;
-            const parkedFailed = batch.items.filter((item) => item.parked && item.failed && !roleComplete(item)).length;
-            notify(
-                remaining || parkedFailed ? 'warning' : 'success',
-                remaining
-                    ? `本轮结束，仍有 ${remaining} 项未完成；点击开始继续补齐`
-                    : parkedFailed
-                      ? `本轮结束，有 ${parkedFailed} 个失败角色已移至「暂移角色」；可点击「全部放回队列」后继续补齐`
-                      : '角色批量生成结束，请到写卡助手预览中加载全部设置并导出',
-            );
+            if (!isManualOne) {
+                const remaining = batch.items.filter((item) => !item.parked && !roleComplete(item)).length;
+                const parkedFailed = batch.items.filter(
+                    (item) => item.parked && item.failed && !roleComplete(item),
+                ).length;
+                notify(
+                    remaining || parkedFailed ? 'warning' : 'success',
+                    remaining
+                        ? `本轮结束，仍有 ${remaining} 项未完成；点击开始继续补齐`
+                        : parkedFailed
+                          ? `本轮结束，有 ${parkedFailed} 个失败角色已移至「暂移角色」；可点击「全部放回队列」后继续补齐`
+                          : '角色批量生成结束，请到写卡助手预览中加载全部设置并导出',
+                );
+            } else if (!processedInRun) {
+                notify('info', '没有待生成的角色');
+            }
         } catch (error) {
             if (!run.controller.signal.aborted) {
                 if (error.code === 'CHECKPOINT_FAILED') onError(error, { phase: 'save-recovery' });
@@ -445,11 +486,30 @@ export function createRoleBatchRunner({
         try {
             restore();
             batch = state();
-            if (!batch || batch.identity !== initial.identity) throw new Error('请回到原批次聊天后重试');
             if (initial.generating === true) throw new Error('请先等待酒馆当前生成结束');
             if (initial.connected === false) throw new Error('酒馆 API 尚未连接');
+            const rosterNames = parseRoleNames(settings.roleNames);
+            const workNames = settings.roleImageLibrary?.workNames;
+            if (!batch || batch.identity !== initial.identity) {
+                const looseTarget = host.resolveCurrentRerollTarget?.(null, { rosterNames, workNames });
+                if (!looseTarget || !host.prepareRoleBatch) throw new Error('请回到原批次聊天后重试');
+                const prepared = host.prepareRoleBatch();
+                if (!prepared.template.includes(ROLE_PLACEHOLDER))
+                    throw new Error(`最后一条用户消息需要包含 ${ROLE_PLACEHOLDER}`);
+                batch = settings.roleBatch = {
+                    id: newIdentity('role-batch'),
+                    identity: initial.identity,
+                    ...prepared,
+                    names: rosterNames,
+                    index: 0,
+                    attempt: 0,
+                    pending: false,
+                    items: [],
+                };
+                hydrateRoleBatch(batch);
+            }
             const previousDispatch = batch.pending && batch.dispatch ? { ...batch.dispatch } : null;
-            await host.reconcileRoleBatch(batch, validationOptions());
+            if (host.reconcileRoleBatch) await host.reconcileRoleBatch(batch, validationOptions());
             assertCurrent(run);
             if (previousDispatch?.itemId) {
                 const previousItem = [...batch.items, ...(batch.history || [])].find(
@@ -464,7 +524,28 @@ export function createRoleBatchRunner({
             assertNoPreview(batch);
             await syncEditedTemplate(batch, run);
             assertCurrent(run);
-            captured = await host.captureRoleReroll(batch);
+            let override = null;
+            if (host.resolveCurrentRerollTarget) {
+                const resolved = host.resolveCurrentRerollTarget(batch, { rosterNames, workNames });
+                if (resolved && !resolved.bound) {
+                    let targetName = resolved.name;
+                    if (!targetName) {
+                        const entered = await host.promptRoleName?.('');
+                        if (!entered) return;
+                        targetName = entered;
+                    }
+                    let targetItem =
+                        resolved.item ||
+                        [...batch.items, ...(batch.history || [])].find((entry) => entry.name === targetName);
+                    if (!targetItem) {
+                        targetItem = { id: newIdentity('role'), name: targetName };
+                        batch.history ??= [];
+                        batch.history.push(targetItem);
+                    }
+                    override = { itemId: targetItem.id, name: targetItem.name, index: resolved.index };
+                }
+            }
+            captured = override ? await host.captureRoleReroll(batch, override) : await host.captureRoleReroll(batch);
             assertCurrent(run);
             if (settings.rerollConfirm === true && host.beginRolePreview) {
                 batch.preview = await host.beginRolePreview(batch, captured);
@@ -509,6 +590,7 @@ export function createRoleBatchRunner({
                 processing: false,
                 processed: true,
                 failed: false,
+                parked: false,
                 manualStatus: null,
                 legacy: false,
                 error: null,
@@ -727,6 +809,7 @@ export function createRoleBatchRunner({
                     processing: false,
                     processed: true,
                     failed: false,
+                    parked: false,
                     manualStatus: manualComplete ? 'complete' : null,
                     legacy: false,
                     error: null,
@@ -768,6 +851,11 @@ export function createRoleBatchRunner({
     }
     return {
         start,
+        generateOne(target = null) {
+            if (!target) return start({ singleStep: true });
+            if (typeof target === 'string') return start({ singleStep: true, targetItemId: target });
+            return start({ singleStep: true, targetItemId: target.id || null, targetName: target.name || null });
+        },
         rerollSelected,
         rerollPreviewAgain,
         acceptPreview: () => resolvePreview(true),
@@ -786,9 +874,10 @@ export function createRoleBatchRunner({
             )
                 throw new Error('当前任务无法调整队列，请回到原聊天并等待准备完成');
             if (!active && host.snapshot().generating) throw new Error('请等待酒馆生成结束');
-            if (!active && batch.pending) throw new Error('上一轮请求尚未确认，请先核对聊天');
             const itemIndex = batch.items.findIndex((item) => item.id === itemId);
             const item = batch.items[itemIndex];
+            if (!active && batch.pending && batch.dispatch?.itemId === itemId)
+                throw new Error('该角色上一轮请求尚未确认，请先核对聊天');
             const boundary = active ? batch.index + (batch.items[batch.index]?.processing ? 1 : 0) : 0;
             const isRestoreAction = action === 'restore' || action === 'restore-origin';
             if (
@@ -848,8 +937,8 @@ export function createRoleBatchRunner({
             )
                 throw new Error('当前任务无法调整队列，请回到原聊天并等待准备完成');
             if (!active && host.snapshot().generating) throw new Error('请等待酒馆生成结束');
-            if (!active && batch.pending) throw new Error('上一轮请求尚未确认，请先核对聊天');
-            const parkedItems = batch.items.filter((item) => item.parked);
+            const pendingId = !active && batch.pending ? batch.dispatch?.itemId : null;
+            const parkedItems = batch.items.filter((item) => item.parked && item.id !== pendingId);
             if (!parkedItems.length) return 0;
             const previous = structuredClone(batch);
             const settings = getSettings();
@@ -858,7 +947,7 @@ export function createRoleBatchRunner({
                 let shiftedBeforeIndex = 0;
                 const remaining = [];
                 batch.items.forEach((item, idx) => {
-                    if (item.parked) {
+                    if (item.parked && item.id !== pendingId) {
                         if (active && idx < batch.index) shiftedBeforeIndex++;
                         item.parked = false;
                     } else {
@@ -890,7 +979,6 @@ export function createRoleBatchRunner({
             )
                 throw new Error('当前任务无法调整队列，请回到原聊天并等待准备完成');
             if (!active && host.snapshot().generating) throw new Error('请等待酒馆生成结束');
-            if (!active && batch.pending) throw new Error('上一轮请求尚未确认，请先核对聊天');
             const previous = structuredClone(batch);
             const settings = getSettings();
             const oldNames = settings.roleNames;
@@ -1042,6 +1130,7 @@ export function createRoleBatchRunner({
                 let archiveRemoved = 0;
                 let archiveAdded = 0;
                 let nameMismatches = 0;
+                let adoptedCount = 0;
                 let archiveChanged = false;
                 for (const entry of entries) {
                     const { item } = entry;
@@ -1074,9 +1163,49 @@ export function createRoleBatchRunner({
                                 processing: false,
                                 processed: true,
                                 failed: false,
+                                parked: false,
                                 error: null,
                                 swipe: entry.swipe,
                             });
+                            const beforeLen = Array.isArray(settings.roleArchive) ? settings.roleArchive.length : 0;
+                            onRoleComplete(item.name);
+                            const afterLen = Array.isArray(settings.roleArchive) ? settings.roleArchive.length : 0;
+                            if (afterLen > beforeLen) archiveAdded += afterLen - beforeLen;
+                        }
+                    }
+                }
+                // 对尚无回执但正文完整的备选页，按正文 YAML 角色名唯一认领到未完成名单项，并同步收录名录。
+                if (host.scanUnboundRoleReplies && host.bindRoleReply) {
+                    const unbound = await host.scanUnboundRoleReplies(batch, options);
+                    const completeUnbound = unbound.filter((entry) => !entry.truncated);
+                    const unclaimedItems = (batch.items || []).filter(
+                        (item) => !roleComplete(item) && item.manualStatus !== 'failed',
+                    );
+                    const itemHits = new Map();
+                    for (const entry of completeUnbound) {
+                        const matches = matchRoleCardToCandidates(unclaimedItems, entry.text, workNames);
+                        if (matches.length !== 1) continue;
+                        const item = matches[0];
+                        const list = itemHits.get(item.id) || [];
+                        list.push({ item, entry });
+                        itemHits.set(item.id, list);
+                    }
+                    for (const hits of itemHits.values()) {
+                        if (hits.length !== 1) continue;
+                        const { item, entry } = hits[0];
+                        if (await host.bindRoleReply(batch, item.id, entry.swipe)) {
+                            Object.assign(item, {
+                                processing: false,
+                                processed: true,
+                                failed: false,
+                                parked: false,
+                                archived: false,
+                                manualStatus: null,
+                                error: null,
+                                nameWarning: null,
+                                swipe: entry.swipe,
+                            });
+                            adoptedCount++;
                             const beforeLen = Array.isArray(settings.roleArchive) ? settings.roleArchive.length : 0;
                             onRoleComplete(item.name);
                             const afterLen = Array.isArray(settings.roleArchive) ? settings.roleArchive.length : 0;
@@ -1093,13 +1222,16 @@ export function createRoleBatchRunner({
                     archiveRemoved,
                     archiveAdded,
                     nameMismatches,
+                    adoptedCount,
                 };
-                if (!entries.length) {
+                if (!entries.length && !adoptedCount) {
                     notify('info', '当前批次还没有已绑定的备选回复可核对');
-                } else if (!truncatedFixed && !nameMismatches && !archiveAdded) {
+                } else if (!truncatedFixed && !nameMismatches && !archiveAdded && !adoptedCount) {
                     notify('success', `核对完成：已检查 ${entries.length} 页备选回复，全部完整且名称一致`);
                 } else {
-                    const parts = [`已检查 ${entries.length} 页`];
+                    const parts = [];
+                    if (entries.length) parts.push(`已检查 ${entries.length} 页`);
+                    if (adoptedCount) parts.push(`认领 ${adoptedCount} 页未绑定完整回复`);
                     if (truncatedFixed) parts.push(`${truncatedFixed} 页截断已标失败并移至暂移区`);
                     if (archiveRemoved) parts.push(`已从名录移出 ${archiveRemoved} 项`);
                     if (archiveAdded) parts.push(`已补录名录 ${archiveAdded} 项`);

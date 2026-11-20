@@ -3,7 +3,7 @@ import { endsWithClosingMarker, estimateTokenCount, isRoleCardTruncated } from '
 import { createRoleResultIsolation, ROLE_BATCH_REQUEST } from './resultIsolation.js';
 import { hashRoleResult, RESULT_HASH_KEY } from './roleResultIntegrity.js';
 import { countUnidentifiedRolePages, unidentifiedRolePageSignature } from '../novel/roleBatchState.js';
-import { selectedRole } from './roleSelection.js';
+import { resolveRerollTarget, selectedRole } from './roleSelection.js';
 import { newIdentity } from '../core/chunkIdentity.js';
 import { ROLE_IMAGE_FOLDER } from '../novel/roleImageLibrary.js';
 
@@ -365,6 +365,48 @@ export function createSillyTavernHost({
         return results;
     }
 
+    /** 找出结果楼层中尚未绑定到当前批次且非预览候选的备选页，供核对时按正文角色名认领。 */
+    async function scanUnboundRoleReplies(batch, validationOptions = {}) {
+        if (!batch || snapshot().identity !== batch.identity) return [];
+        const messages = getChat();
+        const reply = batch.resultFloor == null ? null : messages?.[batch.resultFloor];
+        if (!reply || reply.is_user || reply.is_system) return [];
+        const swipes = Array.isArray(reply.swipes) && reply.swipes.length ? reply.swipes : [reply.mes];
+        const knownIds = new Set([...(batch.items || []), ...(batch.history || [])].map((item) => item.id));
+        const unbound = [];
+        for (let swipe = 0; swipe < swipes.length; swipe++) {
+            const text = String(swipes[swipe] || '');
+            if (!text.trim() || text.trim() === '...') continue;
+            const receipt = reply.swipe_info?.[swipe]?.extra?.nag_role_batch;
+            if (receipt?.previewId) continue;
+            if (receipt?.taskId === batch.id && receipt.itemId && knownIds.has(receipt.itemId)) continue;
+            if (!receipt && (batch.items || []).some((item) => item.legacy && item.swipe === swipe)) continue;
+            const tokenCount = (validationOptions?.minTokens || 0) > 0 ? await countTokens(text) : null;
+            const checkOptions = tokenCount != null ? { ...validationOptions, tokenCount } : validationOptions;
+            const truncated = isRoleCardTruncated(text, checkOptions);
+            unbound.push({ swipe, text, truncated, tokenCount });
+        }
+        return unbound;
+    }
+
+    /** 将结果楼层中的某个完整备选页绑定到指定批次项并持久化回执。 */
+    async function bindRoleReply(batch, itemId, swipe) {
+        if (!batch || snapshot().identity !== batch.identity) return false;
+        const reply = batch.resultFloor == null ? null : getChat()?.[batch.resultFloor];
+        if (!reply || !Array.isArray(reply.swipes) || swipe < 0 || swipe >= reply.swipes.length) return false;
+        const receipt = { taskId: batch.id, itemId, status: 'complete' };
+        reply.swipe_info ??= [];
+        reply.swipe_info[swipe] ??= {};
+        reply.swipe_info[swipe].extra ??= {};
+        reply.swipe_info[swipe].extra.nag_role_batch = receipt;
+        if ((reply.swipe_id ?? 0) === swipe) {
+            reply.extra ??= {};
+            reply.extra.nag_role_batch = receipt;
+        }
+        await getContext().saveChat();
+        return true;
+    }
+
     async function restoreRoleTemplateIfEquals(batch, expected) {
         if (!batch || snapshot().identity !== batch.identity || getChat()?.[batch.promptFloor]?.mes !== expected)
             return false;
@@ -380,7 +422,28 @@ export function createSillyTavernHost({
         return prompt.mes;
     }
 
-    async function captureRoleReroll(batch) {
+    function resolveCurrentRerollTarget(batch, options = {}) {
+        return resolveRerollTarget(batch, getChat(), snapshot().identity, options);
+    }
+
+    async function promptRoleName(defaultName = '') {
+        const popup = getContext()?.Popup?.show;
+        if (typeof popup?.input === 'function') {
+            const value = await popup.input(
+                '重新生成此角色',
+                '未能从当前备选页自动识别角色名，请输入要生成的角色名：',
+                defaultName,
+            );
+            return typeof value === 'string' ? value.trim() : null;
+        }
+        if (typeof globalThis.prompt === 'function') {
+            const value = globalThis.prompt('请输入要重新生成的角色名：', defaultName);
+            return typeof value === 'string' ? value.trim() : null;
+        }
+        return null;
+    }
+
+    async function captureRoleReroll(batch, override = null) {
         if (roleGeneration || snapshot().generating === true) throw new Error('请先等待当前生成结束');
         if (![syncMesToSwipe, syncSwipeToMes, readSavedChat].every((fn) => typeof fn === 'function'))
             throw new Error('当前酒馆缺少安全核对备选回复所需的接口');
@@ -390,10 +453,29 @@ export function createSillyTavernHost({
         if (chat?.length !== batch.resultFloor + 1) throw new Error('回复楼层已经变化，无法安全重生成');
         if (!chat[batch.promptFloor]?.is_user || chat[batch.promptFloor].mes !== batch.template)
             throw new Error('原始提示词已变化，请先核对聊天和批次模板');
-        const selected = selectedRole(batch, message);
+        const selected = override
+            ? Number.isInteger(override.index) &&
+              override.itemId &&
+              override.name &&
+              (message?.swipe_id ?? 0) === override.index &&
+              typeof (message?.swipes?.[override.index] ?? message?.mes) === 'string'
+                ? { index: override.index, item: { id: override.itemId, name: override.name } }
+                : null
+            : selectedRole(batch, message);
         if (!selected) throw new Error('当前备选页没有可靠的角色记录，无法安全重生成');
         if (!syncMesToSwipe(batch.resultFloor)) throw new Error('当前备选页无法同步，请先检查聊天');
+        if (!Array.isArray(message.swipes) || !message.swipes.length) message.swipes = [message.mes];
         const assertSelection = () => {
+            if (override) {
+                if (
+                    snapshot().identity !== batch.identity ||
+                    getChat()?.[batch.resultFloor] !== message ||
+                    (message.swipe_id ?? 0) !== selected.index ||
+                    getChat()?.[batch.promptFloor]?.mes !== batch.template
+                )
+                    throw new Error('预备期间聊天、提示词或备选页已变化，未开始重生成');
+                return;
+            }
             const current = selectedRole(batch, message);
             if (
                 snapshot().identity !== batch.identity ||
@@ -1078,6 +1160,8 @@ export function createSillyTavernHost({
         getContext,
         getChat,
         parseYaml,
+        resolveCurrentRerollTarget,
+        promptRoleName,
         captureRoleReroll,
         readRoleTemplate,
         restoreRoleTemplateIfEquals,
@@ -1146,6 +1230,8 @@ export function createSillyTavernHost({
         restoreRoleTemplate,
         reconcileRoleBatch,
         auditRoleBatch,
+        scanUnboundRoleReplies,
+        bindRoleReply,
         async confirmRoleRestart() {
             return !!(await getContext().Popup.show.confirm(
                 '从头生成全部角色',
